@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment
+.env
+
+# Database
+*.db
+
+# OS
+.DS_Store
+
+# Logs
+*.log

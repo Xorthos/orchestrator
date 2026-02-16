@@ -1,0 +1,60 @@
+# .github/workflows/staging.yml
+# Copy this file to your project repo's .github/workflows/ directory
+#
+# This workflow deploys to staging whenever the staging branch is pushed.
+# Claude merges feature branches into staging after implementation.
+
+name: Deploy to Staging
+
+on:
+  push:
+    branches:
+      - staging
+
+jobs:
+  deploy-staging:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Uncomment and adjust for your stack ──
+
+      # Node.js
+      # - uses: actions/setup-node@v4
+      #   with:
+      #     node-version: '20'
+      #     cache: 'npm'
+      # - run: npm ci
+      # - run: npm run build
+      # - run: npm test
+
+      # Python
+      # - uses: actions/setup-python@v5
+      #   with:
+      #     python-version: '3.12'
+      # - run: pip install -r requirements.txt
+      # - run: python -m pytest
+
+      # .NET
+      # - uses: actions/setup-dotnet@v4
+      #   with:
+      #     dotnet-version: '8.0.x'
+      # - run: dotnet restore
+      # - run: dotnet build
+      # - run: dotnet test
+
+      # ── Deploy to staging ──
+      - name: Deploy to Staging
+        run: |
+          echo "=== Replace this with your staging deploy command ==="
+          echo ""
+          echo "Examples:"
+          echo "  rsync -avz ./dist/ user@staging:/var/www/html/"
+          echo "  aws s3 sync ./build s3://your-staging-bucket"
+          echo "  vercel deploy --prebuilt --token=\$VERCEL_TOKEN"
+          echo "  ssh deploy@staging 'cd /app && git pull && docker-compose up -d'"
+          echo ""
+          echo "Branch: ${{ github.ref_name }}"
+        env:
+          STAGING_DEPLOY_KEY: ${{ secrets.STAGING_DEPLOY_KEY }}
+          # Add other secrets your deploy needs

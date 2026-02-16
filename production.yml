@@ -1,0 +1,37 @@
+# .github/workflows/production.yml
+# Copy this file to your project repo's .github/workflows/ directory
+#
+# This workflow deploys to production whenever master is updated (e.g., after PR merge).
+# Customize the build and deploy steps for your stack.
+
+name: Deploy to Production
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  deploy-production:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Uncomment and adjust for your stack ──
+
+      # Node.js
+      # - uses: actions/setup-node@v4
+      #   with:
+      #     node-version: '20'
+      #     cache: 'npm'
+      # - run: npm ci
+      # - run: npm run build
+      # - run: npm test
+
+      # ── Deploy to production ──
+      - name: Deploy to Production
+        run: |
+          echo "=== Replace this with your production deploy command ==="
+          echo "This should match what currently happens when you push to master."
+        env:
+          PRODUCTION_DEPLOY_KEY: ${{ secrets.PRODUCTION_DEPLOY_KEY }}

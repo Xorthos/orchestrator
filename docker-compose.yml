@@ -1,0 +1,16 @@
+services:
+  orchestrator:
+    build: .
+    ports:
+      - "${WEBHOOK_PORT:-3000}:3000"
+    volumes:
+      - ./:/workspace/repo
+      - orchestrator-data:/data
+    env_file: .env
+    environment:
+      - REPO_PATH=/workspace/repo
+      - DB_PATH=/data
+    restart: unless-stopped
+
+volumes:
+  orchestrator-data:

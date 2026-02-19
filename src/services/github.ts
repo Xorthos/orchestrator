@@ -64,6 +64,68 @@ export class GitHubService {
     return { state: data.state, head: { ref: data.head.ref }, title: data.title };
   }
 
+  async findWorkflowRun(
+    workflowFile: string,
+    branch: string,
+    triggeredAfter: Date
+  ): Promise<{ id: number; status: string; conclusion: string | null } | null> {
+    const { data } = await this.octokit.actions.listWorkflowRuns({
+      owner: this.owner,
+      repo: this.repo,
+      workflow_id: workflowFile,
+      branch,
+      per_page: 5,
+    });
+
+    const cutoff = triggeredAfter.toISOString();
+    const run = data.workflow_runs.find((r) => r.created_at >= cutoff);
+    if (!run) return null;
+
+    return { id: run.id, status: run.status ?? '', conclusion: run.conclusion ?? null };
+  }
+
+  async getWorkflowRunStatus(
+    runId: number
+  ): Promise<{ status: string; conclusion: string | null }> {
+    const { data } = await this.octokit.actions.getWorkflowRun({
+      owner: this.owner,
+      repo: this.repo,
+      run_id: runId,
+    });
+    return { status: data.status ?? '', conclusion: data.conclusion ?? null };
+  }
+
+  async getFailedJobLogs(runId: number): Promise<string> {
+    const { data: jobsData } = await this.octokit.actions.listJobsForWorkflowRun({
+      owner: this.owner,
+      repo: this.repo,
+      run_id: runId,
+      filter: 'latest',
+    });
+
+    const failedJobs = jobsData.jobs.filter((j) => j.conclusion === 'failure');
+    if (failedJobs.length === 0) return 'No failed jobs found.';
+
+    const logs: string[] = [];
+    for (const job of failedJobs) {
+      try {
+        const { data } = await this.octokit.actions.downloadJobLogsForWorkflowRun({
+          owner: this.owner,
+          repo: this.repo,
+          job_id: job.id,
+        });
+        const logText = typeof data === 'string' ? data : String(data);
+        const lines = logText.split('\n');
+        const tail = lines.slice(-200).join('\n');
+        logs.push(`=== Job: ${job.name} (id ${job.id}) ===\n${tail}`);
+      } catch {
+        logs.push(`=== Job: ${job.name} (id ${job.id}) === [log download failed]`);
+      }
+    }
+
+    return logs.join('\n\n');
+  }
+
   async deleteBranch(branchName: string): Promise<void> {
     try {
       await this.octokit.git.deleteRef({

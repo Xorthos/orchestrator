@@ -277,6 +277,8 @@ export class WorkflowEngine {
       this.claude.mergeIntoStaging(branchName);
       this.log.success(`${issueKey} \u2192 Staging branch updated and pushed`);
 
+      await this.waitForStagingWorkflow(issueKey, branchName, summary, taskState);
+
       this.log.info(`${issueKey} \u2192 Smoke testing staging...`);
       const testResult = await this.claude.smokeTestStaging();
       const testNote = testResult.tested
@@ -397,6 +399,8 @@ export class WorkflowEngine {
       this.log.info(`${issueKey} \u2192 Merging fixes into staging...`);
       this.claude.mergeIntoStaging(taskState.branch_name);
 
+      await this.waitForStagingWorkflow(issueKey, taskState.branch_name, taskState.summary, taskState);
+
       const testResult = await this.claude.smokeTestStaging();
       const testNote = testResult.tested
         ? testResult.passed
@@ -436,6 +440,115 @@ export class WorkflowEngine {
     } finally {
       this.claude.cleanup();
       this.processing.delete(issueKey);
+    }
+  }
+
+  // ── GitHub Actions Workflow Monitoring ─────────────────────
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((r) => setTimeout(r, ms));
+  }
+
+  private async pollWorkflowRun(
+    issueKey: string,
+    runId: number
+  ): Promise<{ success: boolean; conclusion: string | null }> {
+    const intervals = [15000, 30000, 60000]; // 15s, 30s, then 60s
+    const maxPollTime = 10 * 60 * 1000; // 10 minutes
+    const start = Date.now();
+    let intervalIdx = 0;
+
+    while (Date.now() - start < maxPollTime) {
+      const { status, conclusion } = await this.github.getWorkflowRunStatus(runId);
+      this.log.debug(`${issueKey} → Workflow run ${runId}: status=${status}, conclusion=${conclusion}`);
+
+      if (status === 'completed') {
+        return { success: conclusion === 'success', conclusion };
+      }
+
+      const delay = intervals[Math.min(intervalIdx, intervals.length - 1)];
+      intervalIdx++;
+      await this.sleep(delay);
+    }
+
+    return { success: false, conclusion: 'timed_out' };
+  }
+
+  private async waitForStagingWorkflow(
+    issueKey: string,
+    branchName: string,
+    summary: string,
+    taskState: { cost_usd?: number | null }
+  ): Promise<void> {
+    const workflowFile = this.config.github.actionsWorkflowFile;
+    if (!workflowFile) return; // backward-compatible: no polling if not configured
+
+    const maxRetries = this.config.github.actionsMaxRetries;
+    const totalAttempts = maxRetries + 1;
+
+    for (let attempt = 1; attempt <= totalAttempts; attempt++) {
+      const pushTime = new Date();
+
+      // Wait for the workflow run to appear (poll up to ~100s)
+      this.log.info(`${issueKey} → Waiting for GitHub Actions workflow to start (attempt ${attempt}/${totalAttempts})...`);
+      let runId: number | null = null;
+      for (let i = 0; i < 10; i++) {
+        await this.sleep(10000);
+        const run = await this.github.findWorkflowRun(workflowFile, 'staging', pushTime);
+        if (run) {
+          runId = run.id;
+          this.log.info(`${issueKey} → Found workflow run ${runId}`);
+          break;
+        }
+      }
+
+      if (!runId) {
+        this.log.warn(`${issueKey} → No workflow run found after ~100s, proceeding anyway`);
+        return;
+      }
+
+      // Poll until completed
+      const result = await this.pollWorkflowRun(issueKey, runId);
+
+      if (result.success) {
+        this.log.success(`${issueKey} → Workflow run ${runId} succeeded`);
+        return;
+      }
+
+      // Workflow failed
+      this.log.warn(`${issueKey} → Workflow run ${runId} failed (conclusion: ${result.conclusion})`);
+
+      if (attempt >= totalAttempts) {
+        throw new Error(
+          `GitHub Actions workflow failed after ${totalAttempts} attempt(s). ` +
+          `Last conclusion: ${result.conclusion}`
+        );
+      }
+
+      // Fetch logs and ask Claude to fix
+      this.log.info(`${issueKey} → Fetching failed job logs...`);
+      const logs = await this.github.getFailedJobLogs(runId);
+
+      this.log.info(`${issueKey} → Claude is fixing the build (attempt ${attempt})...`);
+      await this.jira.addComment(
+        issueKey,
+        `🤖 GitHub Actions workflow failed. Claude is attempting an auto-fix (attempt ${attempt}/${maxRetries})...`
+      );
+
+      const fixResult = await this.claude.fixBuildFailure(issueKey, summary, branchName, logs, attempt);
+      if (!fixResult.success) {
+        throw new Error(`Build fix failed: ${fixResult.error}`);
+      }
+
+      const pushResult = this.claude.pushBuildFix(issueKey, branchName, attempt);
+      if (!pushResult.pushed) {
+        throw new Error(`Build fix produced no changes: ${pushResult.reason}`);
+      }
+
+      // Re-merge into staging
+      this.log.info(`${issueKey} → Re-merging fixed branch into staging...`);
+      this.claude.mergeIntoStaging(branchName);
+      this.log.info(`${issueKey} → Re-merged into staging, polling workflow again...`);
     }
   }
 

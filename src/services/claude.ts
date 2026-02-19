@@ -136,8 +136,8 @@ export class ClaudeService {
       return { tested: false, reason: 'No staging URL configured' };
     }
 
-    this.log.info('Waiting 60s for staging deployment...');
-    await new Promise((r) => setTimeout(r, 60000));
+    this.log.info('Waiting 10s for staging deployment...');
+    await new Promise((r) => setTimeout(r, 10000));
 
     try {
       const response = await fetch(this.stagingUrl, { redirect: 'follow' });
@@ -154,6 +154,59 @@ export class ClaudeService {
     } catch (error) {
       return { tested: true, passed: false, output: (error as Error).message };
     }
+  }
+
+  async fixBuildFailure(
+    issueKey: string,
+    summary: string,
+    branchName: string,
+    failedJobLogs: string,
+    attempt: number
+  ): Promise<ClaudeResult> {
+    this.git(`checkout ${branchName}`);
+    this.git(`pull origin ${branchName}`);
+
+    const prompt = `You are fixing a GitHub Actions build failure for Jira task ${issueKey} (attempt ${attempt}).
+
+## Task: ${summary}
+
+## Branch: ${branchName}
+
+## Failed Job Logs (last 200 lines per job):
+\`\`\`
+${failedJobLogs}
+\`\`\`
+
+## Instructions:
+1. Read the error logs carefully and identify the root cause of the build failure
+2. Fix the code so the build passes
+3. Do NOT change the CI/CD workflow files unless the error is clearly in the workflow config
+4. Keep fixes minimal — only fix what's broken
+5. Run any available build/lint/test commands locally to verify your fix`;
+
+    return this.runClaudeSDK(prompt, {
+      maxTurns: this.maxTurnsImplement,
+      maxBudgetUsd: this.maxBudgetImplement,
+      permissionMode: 'acceptEdits',
+    });
+  }
+
+  pushBuildFix(issueKey: string, branchName: string, attempt: number): { pushed: boolean; reason?: string } {
+    const status = this.git('status --porcelain');
+    if (!status) {
+      return { pushed: false, reason: 'No changes made by build fix' };
+    }
+
+    this.git('add -A');
+
+    const commitMsg = `${issueKey}: Fix build failure (attempt ${attempt})\n\nAutomated build fix by Claude Code.\nJira: ${issueKey}`;
+    const msgFile = join(this.repoPath, '.git', 'CLAUDE_COMMIT_MSG');
+    writeFileSync(msgFile, commitMsg);
+    this.git(`commit -F "${msgFile}"`);
+    unlinkSync(msgFile);
+
+    this.git(`push origin ${branchName}`);
+    return { pushed: true };
   }
 
   cleanup(): void {

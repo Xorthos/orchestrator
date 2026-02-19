@@ -38,6 +38,8 @@ export function loadConfig() {
       token: required('GITHUB_TOKEN'),
       owner: required('GITHUB_OWNER'),
       repo: required('GITHUB_REPO'),
+      actionsWorkflowFile: process.env.GITHUB_ACTIONS_WORKFLOW_FILE || null,
+      actionsMaxRetries: optionalInt('GITHUB_ACTIONS_MAX_RETRIES', 2),
     },
     claude: {
       repoPath: optional('REPO_PATH', '/workspace/repo'),

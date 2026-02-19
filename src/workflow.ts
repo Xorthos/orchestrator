@@ -50,11 +50,24 @@ export class WorkflowEngine {
       return;
     }
 
+    // Check if a failed task was re-assigned to Claude → retry implementation
+    const isAssignedToClaude =
+      this.config.jira.claudeAccountId && assigneeId === this.config.jira.claudeAccountId;
+
+    if (isAssignedToClaude) {
+      const taskState = this.state.getTask(issueKey);
+      if (taskState && (taskState.phase === 'failed' || taskState.phase === 'approved')) {
+        this.log.info(`${issueKey} \u2192 Re-assigned to Claude, retrying implementation...`);
+        this.state.upsertTask(issueKey, { phase: 'approved' });
+        await this.handleImplementation(issueKey);
+        return;
+      }
+    }
+
     // Check if this is a new Claude task ("To Do" + assigned to Claude or labeled)
     if (status === 'to do') {
       const isClaudeTask =
-        (this.config.jira.claudeAccountId && assigneeId === this.config.jira.claudeAccountId) ||
-        labels.includes(this.config.jira.claudeLabel);
+        isAssignedToClaude || labels.includes(this.config.jira.claudeLabel);
 
       if (isClaudeTask) {
         await this.handleNewTask(issue as any);
@@ -275,7 +288,7 @@ export class WorkflowEngine {
       this.log.info(`${issueKey} \u2192 Creating PR...`);
       const pr = await this.github.createPullRequest(
         branchName,
-        'master',
+        this.claude.getDefaultBranch(),
         `${issueKey}: ${summary}`,
         `## ${issueKey}: ${summary}\n\n` +
           `### Approved Plan\n${plan}\n\n` +
@@ -468,7 +481,7 @@ export class WorkflowEngine {
 
       await this.github.mergePullRequest(prNumber, `${issueKey}: ${pr.title}`, 'squash');
       await this.jira.removeLabel(issueKey, `${this.config.jira.claudeLabel}-pr-pending`);
-      await this.jira.addComment(issueKey, `\u{1F916}\u2705 PR #${prNumber} merged to master. Production deploy triggered.`);
+      await this.jira.addComment(issueKey, `\u{1F916}\u2705 PR #${prNumber} merged to ${this.claude.getDefaultBranch()}. Production deploy triggered.`);
 
       await this.github.deleteBranch(pr.head.ref);
       this.state.deleteTask(issueKey);
@@ -555,7 +568,29 @@ export class WorkflowEngine {
         }
       }
 
-      // 4. Check for "Done" tasks needing merge
+      // 4. Check failed/stuck tasks re-assigned to Claude
+      const retryableTasks = [
+        ...this.state.getTasksByPhase('failed'),
+        ...this.state.getTasksByPhase('approved'),
+      ];
+      for (const taskState of retryableTasks) {
+        if (this.processing.has(taskState.issue_key)) continue;
+
+        try {
+          const issue = await this.jira.getIssue(taskState.issue_key);
+          const assigneeId = (issue.fields as any).assignee?.accountId ?? null;
+
+          if (this.config.jira.claudeAccountId && assigneeId === this.config.jira.claudeAccountId) {
+            this.log.info(`${taskState.issue_key} \u2192 Re-assigned to Claude, retrying implementation...`);
+            this.state.upsertTask(taskState.issue_key, { phase: 'approved' });
+            await this.handleImplementation(taskState.issue_key);
+          }
+        } catch (error) {
+          this.log.error(`${taskState.issue_key} \u2192 Reconciliation error: ${(error as Error).message}`);
+        }
+      }
+
+      // 5. Check for "Done" tasks needing merge
       const approvedTasks = await this.jira.findApprovedTasks(this.config.jira.claudeLabel);
       for (const issue of approvedTasks) {
         await this.handleMerge((issue as any).key);

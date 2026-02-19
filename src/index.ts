@@ -49,6 +49,7 @@ async function main() {
 
   try {
     const repo = await github.verifyConnection();
+    claude.setDefaultBranch(repo.defaultBranch);
     log.success(`GitHub: ${repo.fullName} (default: ${repo.defaultBranch})`);
   } catch (error) {
     log.error(`GitHub connection failed: ${(error as Error).message}`);

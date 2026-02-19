@@ -46,7 +46,7 @@ export class JiraService {
       jql = `project = ${this.projectKey} AND labels = "${claudeLabel}" AND status = "To Do" ORDER BY priority DESC, created ASC`;
     }
 
-    const result = await this.client.issueSearch.searchForIssuesUsingJql({
+    const result = await this.client.issueSearch.searchForIssuesUsingJqlEnhancedSearch({
       jql,
       fields: ['summary', 'description', 'priority', 'issuetype', 'labels', 'comment', 'attachment'],
     });
@@ -55,7 +55,7 @@ export class JiraService {
 
   async findApprovedTasks(claudeLabel: string): Promise<unknown[]> {
     const jql = `project = ${this.projectKey} AND labels = "${claudeLabel}-pr-pending" AND status = "Done" ORDER BY updated DESC`;
-    const result = await this.client.issueSearch.searchForIssuesUsingJql({
+    const result = await this.client.issueSearch.searchForIssuesUsingJqlEnhancedSearch({
       jql,
       fields: ['summary', 'labels', 'comment'],
     });

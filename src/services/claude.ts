@@ -8,6 +8,7 @@ import { Logger } from '../logger.js';
 
 export class ClaudeService {
   private repoPath: string;
+  private defaultBranch = 'main';
   private stagingUrl: string | null;
   private useMaxSubscription: boolean;
   private maxTurnsPlan: number;
@@ -25,6 +26,14 @@ export class ClaudeService {
     this.maxBudgetPlan = config.maxBudgetPlan;
     this.maxBudgetImplement = config.maxBudgetImplement;
     this.log = log;
+  }
+
+  setDefaultBranch(branch: string): void {
+    this.defaultBranch = branch;
+  }
+
+  getDefaultBranch(): string {
+    return this.defaultBranch;
   }
 
   // ── Git Operations ──────────────────────────────────────────
@@ -46,8 +55,8 @@ export class ClaudeService {
 
     const branchName = `claude/${issueKey}-${slug}`;
 
-    this.git('checkout master');
-    this.git('pull origin master');
+    this.git(`checkout ${this.defaultBranch}`);
+    this.git(`pull origin ${this.defaultBranch}`);
 
     try {
       this.git(`branch -d ${branchName}`);
@@ -101,8 +110,8 @@ export class ClaudeService {
       this.git('checkout staging');
       this.git('pull origin staging');
     } catch {
-      this.git('checkout master');
-      this.git('pull origin master');
+      this.git(`checkout ${this.defaultBranch}`);
+      this.git(`pull origin ${this.defaultBranch}`);
       this.git('checkout -b staging');
     }
 
@@ -149,7 +158,7 @@ export class ClaudeService {
 
   cleanup(): void {
     try {
-      this.git('checkout master');
+      this.git(`checkout ${this.defaultBranch}`);
     } catch {
       // Best effort
     }
@@ -193,7 +202,7 @@ Be specific about file paths and function names.`;
     return this.runClaudeSDK(prompt, {
       maxTurns: this.maxTurnsPlan,
       maxBudgetUsd: this.maxBudgetPlan,
-      permissionMode: 'plan',
+      permissionMode: 'dontAsk',
       allowedTools: ['Read', 'Grep', 'Glob', 'Bash'],
     });
   }
@@ -273,7 +282,6 @@ Focus specifically on addressing the feedback. Provide a brief summary of what y
       maxTurns: this.maxTurnsImplement,
       maxBudgetUsd: this.maxBudgetImplement,
       permissionMode: 'acceptEdits',
-      resume: sessionId ?? undefined,
     });
   }
 
@@ -282,7 +290,7 @@ Focus specifically on addressing the feedback. Provide a brief summary of what y
     options: {
       maxTurns: number;
       maxBudgetUsd: number;
-      permissionMode: 'plan' | 'acceptEdits';
+      permissionMode: 'plan' | 'acceptEdits' | 'dontAsk';
       allowedTools?: string[];
       resume?: string;
     }
@@ -300,6 +308,7 @@ Focus specifically on addressing the feedback. Provide a brief summary of what y
           cwd: this.repoPath,
           permissionMode: options.permissionMode,
           env: this.buildEnv(),
+          stderr: (data: string) => this.log.debug(`[claude-sdk] ${data.trimEnd()}`),
           ...(options.allowedTools ? { allowedTools: options.allowedTools } : {}),
           ...(options.resume ? { resume: options.resume } : {}),
         },

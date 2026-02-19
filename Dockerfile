@@ -23,9 +23,12 @@ COPY --from=builder /app/node_modules/ node_modules/
 COPY --from=builder /app/dist/ dist/
 COPY --from=builder /app/package.json .
 
-RUN mkdir -p /data
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+RUN mkdir -p /data /workspace/repo
 
 EXPOSE 3000
 
 ENTRYPOINT ["tini", "--"]
-CMD ["node", "dist/index.js"]
+CMD ["/app/entrypoint.sh"]

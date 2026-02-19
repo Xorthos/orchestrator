@@ -40,7 +40,7 @@ export function loadConfig() {
       repo: required('GITHUB_REPO'),
     },
     claude: {
-      repoPath: required('REPO_PATH'),
+      repoPath: optional('REPO_PATH', '/workspace/repo'),
       timeout: optionalInt('CLAUDE_TIMEOUT', 600),
       planTimeout: optionalInt('CLAUDE_PLAN_TIMEOUT', 120),
       stagingUrl: process.env.STAGING_URL || null,

@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   session_id TEXT,
   cost_usd REAL,
   plan_posted_at TEXT,
+  creator_account_id TEXT,
   last_feedback_check TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))

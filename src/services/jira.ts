@@ -48,7 +48,7 @@ export class JiraService {
 
     const result = await this.client.issueSearch.searchForIssuesUsingJqlEnhancedSearch({
       jql,
-      fields: ['summary', 'description', 'priority', 'issuetype', 'labels', 'comment', 'attachment'],
+      fields: ['summary', 'description', 'priority', 'issuetype', 'labels', 'comment', 'attachment', 'reporter'],
     });
     return result.issues ?? [];
   }
@@ -65,7 +65,7 @@ export class JiraService {
   async getIssue(issueKey: string) {
     return this.client.issues.getIssue({
       issueIdOrKey: issueKey,
-      fields: ['summary', 'description', 'priority', 'issuetype', 'labels', 'comment', 'attachment', 'status'],
+      fields: ['summary', 'description', 'priority', 'issuetype', 'labels', 'comment', 'attachment', 'status', 'reporter'],
     });
   }
 

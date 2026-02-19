@@ -18,6 +18,11 @@ export class WorkflowEngine {
     private claude: ClaudeService
   ) {}
 
+  private getAssignBackId(issueKey: string): string | null {
+    const taskState = this.state.getTask(issueKey);
+    return taskState?.creator_account_id ?? this.config.jira.yourAccountId;
+  }
+
   // ── Webhook Entry Point ─────────────────────────────────────
 
   async handleWebhook(payload: JiraWebhookPayload): Promise<void> {
@@ -100,10 +105,11 @@ export class WorkflowEngine {
 
   // ── Phase 1: Plan ──────────────────────────────────────────
 
-  private async handleNewTask(issue: { key: string; fields: { summary: string; description?: unknown } }): Promise<void> {
+  private async handleNewTask(issue: { key: string; fields: { summary: string; description?: unknown; reporter?: { accountId: string } | null } }): Promise<void> {
     const issueKey = issue.key;
     const summary = issue.fields.summary;
     const description = this.jira.descriptionToText(issue.fields.description);
+    const creatorAccountId = issue.fields.reporter?.accountId ?? null;
 
     if (this.processing.has(issueKey)) return;
 
@@ -138,8 +144,9 @@ export class WorkflowEngine {
           `**To ask Claude a question:** Just comment your question`
       );
 
-      if (this.config.jira.yourAccountId) {
-        await this.jira.assignIssue(issueKey, this.config.jira.yourAccountId);
+      const assignBackId = creatorAccountId ?? this.config.jira.yourAccountId;
+      if (assignBackId) {
+        await this.jira.assignIssue(issueKey, assignBackId);
       }
 
       this.state.upsertTask(issueKey, {
@@ -147,6 +154,7 @@ export class WorkflowEngine {
         plan,
         summary,
         description,
+        creator_account_id: creatorAccountId,
         session_id: result.sessionId,
         cost_usd: result.costUsd,
         plan_posted_at: new Date().toISOString(),
@@ -159,8 +167,9 @@ export class WorkflowEngine {
         issueKey,
         `\u{1F916}\u274C Planning failed:\n\n${(error as Error).message}\n\nPlease adjust the task description and retry.`
       );
-      if (this.config.jira.yourAccountId) {
-        await this.jira.assignIssue(issueKey, this.config.jira.yourAccountId);
+      const errorAssignId = creatorAccountId ?? this.config.jira.yourAccountId;
+      if (errorAssignId) {
+        await this.jira.assignIssue(issueKey, errorAssignId);
       }
     } finally {
       this.processing.delete(issueKey);
@@ -316,8 +325,9 @@ export class WorkflowEngine {
 
       await this.jira.transitionIssue(issueKey, 'Test');
 
-      if (this.config.jira.yourAccountId) {
-        await this.jira.assignIssue(issueKey, this.config.jira.yourAccountId);
+      const implAssignId = this.getAssignBackId(issueKey);
+      if (implAssignId) {
+        await this.jira.assignIssue(issueKey, implAssignId);
       }
 
       this.state.upsertTask(issueKey, {
@@ -338,8 +348,9 @@ export class WorkflowEngine {
         `\u{1F916}\u274C Implementation error:\n\n${(error as Error).message}\n\nPlease review and retry or handle manually.`
       );
 
-      if (this.config.jira.yourAccountId) {
-        await this.jira.assignIssue(issueKey, this.config.jira.yourAccountId);
+      const implErrAssignId = this.getAssignBackId(issueKey);
+      if (implErrAssignId) {
+        await this.jira.assignIssue(issueKey, implErrAssignId);
       }
 
       this.state.upsertTask(issueKey, { phase: 'failed' });
@@ -417,8 +428,9 @@ export class WorkflowEngine {
           `Move to **"Done"** when satisfied, or comment again with further feedback.`
       );
 
-      if (this.config.jira.yourAccountId) {
-        await this.jira.assignIssue(issueKey, this.config.jira.yourAccountId);
+      const testAssignId = this.getAssignBackId(issueKey);
+      if (testAssignId) {
+        await this.jira.assignIssue(issueKey, testAssignId);
       }
 
       this.state.upsertTask(issueKey, {
@@ -434,8 +446,9 @@ export class WorkflowEngine {
         issueKey,
         `\u{1F916}\u274C Rework failed:\n\n${(error as Error).message}\n\nPlease check manually or provide different feedback.`
       );
-      if (this.config.jira.yourAccountId) {
-        await this.jira.assignIssue(issueKey, this.config.jira.yourAccountId);
+      const testErrAssignId = this.getAssignBackId(issueKey);
+      if (testErrAssignId) {
+        await this.jira.assignIssue(issueKey, testErrAssignId);
       }
     } finally {
       this.claude.cleanup();

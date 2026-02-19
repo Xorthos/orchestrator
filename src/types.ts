@@ -20,6 +20,7 @@ export interface TaskRow {
   session_id: string | null;
   cost_usd: number | null;
   plan_posted_at: string | null;
+  creator_account_id: string | null;
   last_feedback_check: string | null;
   created_at: string;
   updated_at: string;
@@ -38,6 +39,7 @@ export interface JiraWebhookPayload {
       status?: { name: string; id: string };
       labels?: string[];
       assignee?: { accountId: string; displayName: string } | null;
+      reporter?: { accountId: string; displayName: string } | null;
       priority?: { name: string };
       issuetype?: { name: string };
       comment?: { comments: JiraComment[] };

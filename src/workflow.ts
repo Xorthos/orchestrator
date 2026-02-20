@@ -96,7 +96,9 @@ export class WorkflowEngine {
     // Skip bot comments
     if (commentText.startsWith('\u{1F916}')) return;
 
-    if (taskState.phase === 'plan-posted') {
+    if (taskState.phase === 'planning') {
+      await this.handleQuestionAnswers(issueKey, commentText);
+    } else if (taskState.phase === 'plan-posted') {
       await this.handlePlanFeedback(issueKey, commentText);
     } else if (taskState.phase === 'test') {
       await this.handleTestFeedback(issueKey, commentText);
@@ -133,34 +135,57 @@ export class WorkflowEngine {
         throw new Error(`Planning failed: ${result.error || 'Unknown error'}`);
       }
 
-      const plan = result.output;
-
-      await this.jira.addComment(
-        issueKey,
-        `\u{1F916} **Implementation Plan:**\n\n${plan}\n\n` +
-          `---\n` +
-          `**To approve:** Comment \`approve\` (optionally add notes after it)\n` +
-          `**To reject/modify:** Comment with your feedback and Claude will re-plan\n` +
-          `**To ask Claude a question:** Just comment your question`
-      );
-
       const assignBackId = creatorAccountId ?? this.config.jira.yourAccountId;
-      if (assignBackId) {
-        await this.jira.assignIssue(issueKey, assignBackId);
+
+      if (result.hasQuestions) {
+        await this.jira.addComment(
+          issueKey,
+          `\u{1F916} **Before I can plan this, I have a few questions:**\n\n${result.questions}\n\n` +
+            `---\n` +
+            `Please reply with your answers and I\u2019ll create the plan.`
+        );
+
+        if (assignBackId) {
+          await this.jira.assignIssue(issueKey, assignBackId);
+        }
+
+        this.state.upsertTask(issueKey, {
+          phase: 'planning',
+          summary,
+          description,
+          creator_account_id: creatorAccountId,
+          session_id: result.sessionId,
+          cost_usd: result.costUsd,
+        });
+
+        this.log.info(`${issueKey} \u2192 Questions posted. Waiting for answers.`);
+      } else {
+        await this.jira.addComment(
+          issueKey,
+          `\u{1F916} **Implementation Plan:**\n\n${result.functionalSummary}\n\n` +
+            `---\n` +
+            `**To approve:** Comment \`approve\` (optionally add notes after it)\n` +
+            `**To reject/modify:** Comment with your feedback and Claude will re-plan\n` +
+            `**To ask Claude a question:** Just comment your question`
+        );
+
+        if (assignBackId) {
+          await this.jira.assignIssue(issueKey, assignBackId);
+        }
+
+        this.state.upsertTask(issueKey, {
+          phase: 'plan-posted',
+          plan: result.technicalPlan,
+          summary,
+          description,
+          creator_account_id: creatorAccountId,
+          session_id: result.sessionId,
+          cost_usd: result.costUsd,
+          plan_posted_at: new Date().toISOString(),
+        });
+
+        this.log.success(`${issueKey} \u2192 Plan posted. Waiting for your approval.`);
       }
-
-      this.state.upsertTask(issueKey, {
-        phase: 'plan-posted',
-        plan,
-        summary,
-        description,
-        creator_account_id: creatorAccountId,
-        session_id: result.sessionId,
-        cost_usd: result.costUsd,
-        plan_posted_at: new Date().toISOString(),
-      });
-
-      this.log.success(`${issueKey} \u2192 Plan posted. Waiting for your approval.`);
     } catch (error) {
       this.log.error(`${issueKey} \u2192 Planning failed: ${(error as Error).message}`);
       await this.jira.addComment(
@@ -171,6 +196,83 @@ export class WorkflowEngine {
       if (errorAssignId) {
         await this.jira.assignIssue(issueKey, errorAssignId);
       }
+    } finally {
+      this.processing.delete(issueKey);
+    }
+  }
+
+  // ── Phase 1a: Question Answers ─────────────────────────────
+
+  private async handleQuestionAnswers(issueKey: string, answers: string): Promise<void> {
+    if (this.processing.has(issueKey)) return;
+
+    const taskState = this.state.getTask(issueKey);
+    if (!taskState) return;
+
+    this.log.info(`${issueKey} \u2192 Received answers, re-running planning...`);
+    this.processing.add(issueKey);
+
+    try {
+      await this.jira.addComment(
+        issueKey,
+        `\u{1F916} Thanks for the answers \u2014 creating the implementation plan now...`
+      );
+
+      const enrichedDescription =
+        `${taskState.description}\n\n## Additional context (answers to clarifying questions):\n${answers}`;
+
+      const result = await this.claude.createPlan(issueKey, taskState.summary, enrichedDescription);
+
+      if (!result.success) {
+        throw new Error(`Planning failed: ${result.error || 'Unknown error'}`);
+      }
+
+      const assignBackId = this.getAssignBackId(issueKey);
+
+      if (result.hasQuestions) {
+        await this.jira.addComment(
+          issueKey,
+          `\u{1F916} **I still have a few questions:**\n\n${result.questions}\n\n` +
+            `---\n` +
+            `Please reply with your answers and I\u2019ll create the plan.`
+        );
+
+        this.state.upsertTask(issueKey, {
+          description: enrichedDescription,
+          session_id: result.sessionId,
+          cost_usd: (taskState.cost_usd ?? 0) + (result.costUsd ?? 0),
+        });
+      } else {
+        await this.jira.addComment(
+          issueKey,
+          `\u{1F916} **Implementation Plan:**\n\n${result.functionalSummary}\n\n` +
+            `---\n` +
+            `**To approve:** Comment \`approve\` (optionally add notes after it)\n` +
+            `**To reject/modify:** Comment with your feedback and Claude will re-plan\n` +
+            `**To ask Claude a question:** Just comment your question`
+        );
+
+        if (assignBackId) {
+          await this.jira.assignIssue(issueKey, assignBackId);
+        }
+
+        this.state.upsertTask(issueKey, {
+          phase: 'plan-posted',
+          plan: result.technicalPlan,
+          description: enrichedDescription,
+          session_id: result.sessionId,
+          cost_usd: (taskState.cost_usd ?? 0) + (result.costUsd ?? 0),
+          plan_posted_at: new Date().toISOString(),
+        });
+
+        this.log.success(`${issueKey} \u2192 Plan posted. Waiting for approval.`);
+      }
+    } catch (error) {
+      this.log.error(`${issueKey} \u2192 Planning after answers failed: ${(error as Error).message}`);
+      await this.jira.addComment(
+        issueKey,
+        `\u{1F916}\u274C Planning failed:\n\n${(error as Error).message}\n\nPlease adjust the task and retry.`
+      );
     } finally {
       this.processing.delete(issueKey);
     }
@@ -215,7 +317,7 @@ export class WorkflowEngine {
         if (result.success) {
           await this.jira.addComment(
             issueKey,
-            `\u{1F916} **Updated Plan:**\n\n${result.output}\n\n` +
+            `\u{1F916} **Updated Plan:**\n\n${result.functionalSummary}\n\n` +
               `---\n` +
               `**To approve:** Comment \`approve\`\n` +
               `**More feedback?** Just comment.`
@@ -223,7 +325,7 @@ export class WorkflowEngine {
 
           this.state.upsertTask(issueKey, {
             phase: 'plan-posted',
-            plan: result.output,
+            plan: result.technicalPlan,
             session_id: result.sessionId,
             cost_usd: (taskState.cost_usd ?? 0) + (result.costUsd ?? 0),
             plan_posted_at: new Date().toISOString(),
@@ -636,7 +738,33 @@ export class WorkflowEngine {
         await this.handleNewTask(task as any);
       }
 
-      // 2. Check plan approvals by polling comments
+      // 2a. Check for answers to questions
+      const questionTasks = this.state.getTasksByPhase('planning');
+      for (const taskState of questionTasks) {
+        if (this.processing.has(taskState.issue_key)) continue;
+
+        try {
+          const issue = await this.jira.getIssue(taskState.issue_key);
+          const comments = (issue.fields as any).comment?.comments ?? [];
+          const lastUpdate = new Date(taskState.updated_at).getTime();
+
+          for (let i = comments.length - 1; i >= 0; i--) {
+            const comment = comments[i];
+            const text = this.jira.descriptionToText(comment.body).trim();
+            const commentTime = new Date(comment.created).getTime();
+
+            if (text.startsWith('\u{1F916}')) continue;
+            if (commentTime <= lastUpdate) break;
+
+            await this.handleQuestionAnswers(taskState.issue_key, text);
+            break;
+          }
+        } catch (error) {
+          this.log.error(`${taskState.issue_key} \u2192 Reconciliation error: ${(error as Error).message}`);
+        }
+      }
+
+      // 2b. Check plan approvals by polling comments
       const planTasks = this.state.getTasksByPhase('plan-posted');
       for (const taskState of planTasks) {
         if (this.processing.has(taskState.issue_key)) continue;

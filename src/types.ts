@@ -76,3 +76,10 @@ export interface ClaudeResult {
   costUsd: number | null;
   error?: string;
 }
+
+export interface PlanResult extends ClaudeResult {
+  technicalPlan: string;
+  functionalSummary: string;
+  hasQuestions: boolean;
+  questions: string;
+}

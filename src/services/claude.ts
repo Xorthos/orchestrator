@@ -3,7 +3,7 @@ import { writeFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import type { Config } from '../config.js';
-import type { ClaudeResult } from '../types.js';
+import type { ClaudeResult, PlanResult } from '../types.js';
 import { Logger } from '../logger.js';
 
 export class ClaudeService {
@@ -228,7 +228,10 @@ ${failedJobLogs}
     return env;
   }
 
-  async createPlan(issueKey: string, summary: string, description: string): Promise<ClaudeResult> {
+  private static readonly PLAN_DELIMITER = '===FUNCTIONAL SUMMARY===';
+  private static readonly QUESTIONS_DELIMITER = '===QUESTIONS===';
+
+  async createPlan(issueKey: string, summary: string, description: string): Promise<PlanResult> {
     const prompt = `You are analyzing Jira task ${issueKey} to create an implementation plan.
 DO NOT make any code changes yet. Only analyze and plan.
 
@@ -239,29 +242,71 @@ ${description || 'No additional description provided.'}
 
 ## Instructions:
 1. Read the existing codebase (check CLAUDE.md if it exists)
-2. Identify which files need to be created or modified
-3. Think about edge cases and potential issues
-4. Consider if tests need to be added or updated
+2. Understand the current functionality and how it relates to this task
+3. Figure out exactly what needs to change and what the impact will be
+4. Think about edge cases and potential issues
 
 ## CRITICAL — Output rules:
 - While analyzing, you may explore the codebase using tools. Do NOT narrate what you are doing (e.g. "Let me search for...", "Now I'll read..."). Work silently.
-- Your FINAL message must contain ONLY the implementation plan — no preamble, no narration, no analysis recap.
-- Use this format for the plan:
+- No preamble, no narration, no analysis recap in your final message.
+- Your FINAL message must follow ONE of the two formats below:
 
-**Files to modify**: List each file and what changes are needed
-**New files**: Any new files to create
-**Approach**: Brief description of the technical approach
-**Risks / Questions**: Anything unclear or risky that needs human input
-**Estimated scope**: Small / Medium / Large
+### Format A — If you need clarification before you can plan:
+If the task description is ambiguous, missing critical details, or could be interpreted in multiple ways, output ONLY:
 
-Be specific about file paths and function names.`;
+${ClaudeService.QUESTIONS_DELIMITER}
+Your questions here as a numbered list. Be specific about what you need to know and why.
+Keep questions short and to the point. The reader is a non-technical project manager.
 
-    return this.runClaudeSDK(prompt, {
+### Format B — If you have enough information to plan:
+Output exactly TWO sections separated by the line: ${ClaudeService.PLAN_DELIMITER}
+
+**Section 1 — Technical Plan (ABOVE the separator)**
+A detailed technical plan that another AI can implement from. Include:
+- Specific files to modify or create, with file paths
+- What changes are needed in each file
+- Technical approach and implementation details
+- Edge cases to handle
+
+**Section 2 — Functional Summary (BELOW the separator)**
+A plain-language summary for a non-technical project manager. No file names, no code, no jargon. Include:
+- **What changes:** What the user will see or experience differently
+- **How it works:** A short, plain-language explanation of the approach
+- **What to watch out for:** Any risks, open questions, or things needing human input
+- **Scope:** Small / Medium / Large — with a one-sentence justification
+
+Use Format A ONLY when the task genuinely cannot be planned without more information. If reasonable assumptions can be made, prefer Format B and note your assumptions under "What to watch out for".`;
+
+    const result = await this.runClaudeSDK(prompt, {
       maxTurns: this.maxTurnsPlan,
       maxBudgetUsd: this.maxBudgetPlan,
       permissionMode: 'dontAsk',
       allowedTools: ['Read', 'Grep', 'Glob', 'Bash'],
     });
+
+    return this.parsePlanResult(result);
+  }
+
+  private parsePlanResult(result: ClaudeResult): PlanResult {
+    const output = result.output;
+
+    // Check for questions first
+    const questionsIndex = output.indexOf(ClaudeService.QUESTIONS_DELIMITER);
+    if (questionsIndex !== -1) {
+      const questions = output.substring(questionsIndex + ClaudeService.QUESTIONS_DELIMITER.length).trim();
+      return { ...result, technicalPlan: '', functionalSummary: '', hasQuestions: true, questions };
+    }
+
+    // Otherwise parse as plan
+    const delimIndex = output.indexOf(ClaudeService.PLAN_DELIMITER);
+    if (delimIndex === -1) {
+      return { ...result, technicalPlan: output, functionalSummary: output, hasQuestions: false, questions: '' };
+    }
+
+    const technicalPlan = output.substring(0, delimIndex).trim();
+    const functionalSummary = output.substring(delimIndex + ClaudeService.PLAN_DELIMITER.length).trim();
+
+    return { ...result, technicalPlan, functionalSummary, hasQuestions: false, questions: '' };
   }
 
   async implementPlan(

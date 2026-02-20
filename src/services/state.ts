@@ -22,6 +22,10 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 `;
 
+const MIGRATIONS = [
+  `ALTER TABLE tasks ADD COLUMN creator_account_id TEXT`,
+];
+
 export class StateManager {
   private db: Database.Database;
 
@@ -30,6 +34,17 @@ export class StateManager {
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('busy_timeout = 5000');
     this.db.exec(SCHEMA);
+    this.runMigrations();
+  }
+
+  private runMigrations(): void {
+    for (const sql of MIGRATIONS) {
+      try {
+        this.db.exec(sql);
+      } catch {
+        // Column already exists — skip
+      }
+    }
   }
 
   getTask(issueKey: string): TaskRow | null {

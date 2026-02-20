@@ -243,12 +243,16 @@ ${description || 'No additional description provided.'}
 3. Think about edge cases and potential issues
 4. Consider if tests need to be added or updated
 
-## Output format — produce a clear, numbered plan with:
-- **Files to modify**: List each file and what changes are needed
-- **New files**: Any new files to create
-- **Approach**: Brief description of the technical approach
-- **Risks / Questions**: Anything unclear or risky that needs human input
-- **Estimated scope**: Small / Medium / Large
+## CRITICAL — Output rules:
+- While analyzing, you may explore the codebase using tools. Do NOT narrate what you are doing (e.g. "Let me search for...", "Now I'll read..."). Work silently.
+- Your FINAL message must contain ONLY the implementation plan — no preamble, no narration, no analysis recap.
+- Use this format for the plan:
+
+**Files to modify**: List each file and what changes are needed
+**New files**: Any new files to create
+**Approach**: Brief description of the technical approach
+**Risks / Questions**: Anything unclear or risky that needs human input
+**Estimated scope**: Small / Medium / Large
 
 Be specific about file paths and function names.`;
 
@@ -374,10 +378,14 @@ Focus specifically on addressing the feedback. Provide a brief summary of what y
             break;
           case 'assistant':
             if ((event as any).message?.content) {
+              let turnText = '';
               for (const block of (event as any).message.content) {
                 if (block.type === 'text') {
-                  outputText += block.text;
+                  turnText += block.text;
                 }
+              }
+              if (turnText) {
+                outputText = turnText;
               }
             }
             break;

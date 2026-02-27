@@ -16,6 +16,7 @@ export interface TaskRow {
   branch_name: string | null;
   pr_number: number | null;
   pr_url: string | null;
+  worktree_path: string | null;
   reviewer_notes: string | null;
   session_id: string | null;
   cost_usd: number | null;
@@ -67,6 +68,25 @@ export interface JiraComment {
   body: unknown;
   created: string;
   updated: string;
+}
+
+export interface GitHubWebhookPayload {
+  action: string;
+  review?: {
+    state: string; // 'approved', 'changes_requested', 'commented'
+    body: string;
+    user: { login: string };
+  };
+  pull_request?: {
+    number: number;
+    head: { ref: string };
+    title: string;
+    body: string;
+  };
+  comment?: {
+    body: string;
+    user: { login: string };
+  };
 }
 
 export interface ClaudeResult {

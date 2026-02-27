@@ -1,5 +1,6 @@
 import { Version3Client } from 'jira.js';
 import type { Config } from '../config.js';
+import { withRetry } from '../utils/retry.js';
 
 interface AdfNode {
   type: string;
@@ -46,33 +47,39 @@ export class JiraService {
       jql = `project = ${this.projectKey} AND labels = "${claudeLabel}" AND status = "To Do" ORDER BY priority DESC, created ASC`;
     }
 
-    const result = await this.client.issueSearch.searchForIssuesUsingJqlEnhancedSearch({
-      jql,
-      fields: ['summary', 'description', 'priority', 'issuetype', 'labels', 'comment', 'attachment', 'reporter'],
+    return withRetry(async () => {
+      const result = await this.client.issueSearch.searchForIssuesUsingJqlEnhancedSearch({
+        jql,
+        fields: ['summary', 'description', 'priority', 'issuetype', 'labels', 'comment', 'attachment', 'reporter'],
+      });
+      return result.issues ?? [];
     });
-    return result.issues ?? [];
   }
 
   async findApprovedTasks(claudeLabel: string): Promise<unknown[]> {
     const jql = `project = ${this.projectKey} AND labels = "${claudeLabel}-pr-pending" AND status = "Done" ORDER BY updated DESC`;
-    const result = await this.client.issueSearch.searchForIssuesUsingJqlEnhancedSearch({
-      jql,
-      fields: ['summary', 'labels', 'comment'],
+    return withRetry(async () => {
+      const result = await this.client.issueSearch.searchForIssuesUsingJqlEnhancedSearch({
+        jql,
+        fields: ['summary', 'labels', 'comment'],
+      });
+      return result.issues ?? [];
     });
-    return result.issues ?? [];
   }
 
   async getIssue(issueKey: string) {
-    return this.client.issues.getIssue({
-      issueIdOrKey: issueKey,
-      fields: ['summary', 'description', 'priority', 'issuetype', 'labels', 'comment', 'attachment', 'status', 'reporter'],
-    });
+    return withRetry(() =>
+      this.client.issues.getIssue({
+        issueIdOrKey: issueKey,
+        fields: ['summary', 'description', 'priority', 'issuetype', 'labels', 'comment', 'attachment', 'status', 'reporter'],
+      })
+    );
   }
 
   async transitionIssue(issueKey: string, statusName: string): Promise<void> {
-    const transitions = await this.client.issues.getTransitions({
-      issueIdOrKey: issueKey,
-    });
+    const transitions = await withRetry(() =>
+      this.client.issues.getTransitions({ issueIdOrKey: issueKey })
+    );
 
     const transition = transitions.transitions?.find(
       (t) => t.name?.toLowerCase() === statusName.toLowerCase()
@@ -85,42 +92,82 @@ export class JiraService {
       );
     }
 
-    await this.client.issues.doTransition({
-      issueIdOrKey: issueKey,
-      transition: { id: transition.id },
-    });
+    await withRetry(() =>
+      this.client.issues.doTransition({
+        issueIdOrKey: issueKey,
+        transition: { id: transition.id },
+      })
+    );
   }
 
   async assignIssue(issueKey: string, accountId: string): Promise<void> {
-    await this.client.issues.assignIssue({
-      issueIdOrKey: issueKey,
-      accountId,
-    });
+    await withRetry(() =>
+      this.client.issues.assignIssue({ issueIdOrKey: issueKey, accountId })
+    );
   }
 
   async addComment(issueKey: string, text: string): Promise<void> {
-    await this.client.issueComments.addComment({
-      issueIdOrKey: issueKey,
-      comment: this.markdownToAdf(text) as any,
-    });
+    await withRetry(() =>
+      this.client.issueComments.addComment({
+        issueIdOrKey: issueKey,
+        comment: this.markdownToAdf(text) as any,
+      })
+    );
   }
 
   async addLabel(issueKey: string, label: string): Promise<void> {
-    await this.client.issues.editIssue({
-      issueIdOrKey: issueKey,
-      update: {
-        labels: [{ add: label }],
-      },
-    });
+    await withRetry(() =>
+      this.client.issues.editIssue({
+        issueIdOrKey: issueKey,
+        update: { labels: [{ add: label }] },
+      })
+    );
   }
 
   async removeLabel(issueKey: string, label: string): Promise<void> {
-    await this.client.issues.editIssue({
-      issueIdOrKey: issueKey,
-      update: {
-        labels: [{ remove: label }],
-      },
-    });
+    await withRetry(() =>
+      this.client.issues.editIssue({
+        issueIdOrKey: issueKey,
+        update: { labels: [{ remove: label }] },
+      })
+    );
+  }
+
+  async getAttachmentContext(issueKey: string): Promise<string> {
+    const issue = await this.getIssue(issueKey);
+    const attachments = (issue.fields as any).attachment ?? [];
+    if (attachments.length === 0) return '';
+
+    const textExtensions = ['.md', '.txt', '.json', '.yaml', '.yml', '.csv', '.html', '.xml'];
+    const maxSize = 50000;
+    const parts: string[] = [];
+
+    for (const att of attachments) {
+      const filename: string = att.filename ?? '';
+      const mimeType: string = att.mimeType ?? '';
+      const size: number = att.size ?? 0;
+      const contentUrl: string = att.content ?? '';
+
+      const isText = textExtensions.some((ext) => filename.toLowerCase().endsWith(ext));
+
+      if (isText && size < maxSize && contentUrl) {
+        try {
+          const response = await fetch(contentUrl, {
+            headers: {
+              Authorization: `Basic ${Buffer.from(`${this.config.email}:${this.config.apiToken}`).toString('base64')}`,
+            },
+          });
+          const content = await response.text();
+          parts.push(`\n\n## Attachment: ${filename}\n\`\`\`\n${content}\n\`\`\``);
+        } catch {
+          parts.push(`\n\n[Attached file: ${filename} (${mimeType}, ${size} bytes) — download failed]`);
+        }
+      } else {
+        parts.push(`\n\n[Attached file: ${filename} (${mimeType}, ${size} bytes)]`);
+      }
+    }
+
+    return parts.join('');
   }
 
   descriptionToText(description: unknown): string {

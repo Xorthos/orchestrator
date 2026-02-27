@@ -5,6 +5,7 @@ import { StateManager } from './services/state.js';
 import { JiraService } from './services/jira.js';
 import { GitHubService } from './services/github.js';
 import { ClaudeService } from './services/claude.js';
+import { Notifier } from './services/notifier.js';
 import { WorkflowEngine } from './workflow.js';
 import { createServer } from './server.js';
 
@@ -29,6 +30,9 @@ async function main() {
   log.info(`Detection:   ${config.jira.claudeAccountId ? 'Assignee-based' : `Label: ${config.jira.claudeLabel}`}`);
   log.info(`Repo path:   ${config.claude.repoPath}`);
   log.info(`Cost limits: Plan $${config.claude.maxBudgetPlan} / Implement $${config.claude.maxBudgetImplement}`);
+  log.info(`Teams:       ${config.teamsWebhookUrl ? 'enabled' : 'disabled'}`);
+  log.info(`GH webhook:  ${config.webhook.githubSecret ? 'enabled (HMAC)' : config.webhook.githubSecret === null ? 'enabled (no HMAC)' : 'disabled'}`);
+  log.info(`Stale check: ${config.staleTaskHours > 0 ? `${config.staleTaskHours}h` : 'disabled'}`);
   console.log('');
 
   // Init services
@@ -37,6 +41,7 @@ async function main() {
   const jira = new JiraService(config.jira);
   const github = new GitHubService(config.github);
   const claude = new ClaudeService(config.claude, log);
+  const notifier = new Notifier(config.teamsWebhookUrl, config.notificationEvents, log);
 
   // Verify connections
   try {
@@ -67,7 +72,7 @@ async function main() {
   console.log('');
 
   // Create workflow engine and server
-  const workflow = new WorkflowEngine(config, log, state, jira, github, claude);
+  const workflow = new WorkflowEngine(config, log, state, jira, github, claude, notifier);
   const app = createServer(config, log, workflow);
 
   // Start Express server

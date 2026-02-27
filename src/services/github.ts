@@ -1,5 +1,6 @@
 import { Octokit } from '@octokit/rest';
 import type { Config } from '../config.js';
+import { withRetry } from '../utils/retry.js';
 
 export class GitHubService {
   private octokit: Octokit;
@@ -13,14 +14,10 @@ export class GitHubService {
   }
 
   async verifyConnection(): Promise<{ fullName: string; defaultBranch: string }> {
-    const { data } = await this.octokit.repos.get({
-      owner: this.owner,
-      repo: this.repo,
-    });
-    return {
-      fullName: data.full_name,
-      defaultBranch: data.default_branch,
-    };
+    const { data } = await withRetry(() =>
+      this.octokit.repos.get({ owner: this.owner, repo: this.repo })
+    );
+    return { fullName: data.full_name, defaultBranch: data.default_branch };
   }
 
   async createPullRequest(
@@ -29,15 +26,13 @@ export class GitHubService {
     title: string,
     body: string
   ): Promise<{ number: number; html_url: string }> {
-    const { data } = await this.octokit.pulls.create({
-      owner: this.owner,
-      repo: this.repo,
-      head,
-      base,
-      title,
-      body,
-      draft: false,
-    });
+    const { data } = await withRetry(() =>
+      this.octokit.pulls.create({
+        owner: this.owner,
+        repo: this.repo,
+        head, base, title, body, draft: false,
+      })
+    );
     return { number: data.number, html_url: data.html_url };
   }
 
@@ -46,21 +41,25 @@ export class GitHubService {
     commitTitle: string,
     mergeMethod: 'squash' | 'merge' | 'rebase' = 'squash'
   ): Promise<void> {
-    await this.octokit.pulls.merge({
-      owner: this.owner,
-      repo: this.repo,
-      pull_number: prNumber,
-      commit_title: commitTitle,
-      merge_method: mergeMethod,
-    });
+    await withRetry(() =>
+      this.octokit.pulls.merge({
+        owner: this.owner,
+        repo: this.repo,
+        pull_number: prNumber,
+        commit_title: commitTitle,
+        merge_method: mergeMethod,
+      })
+    );
   }
 
   async getPullRequest(prNumber: number): Promise<{ state: string; head: { ref: string }; title: string }> {
-    const { data } = await this.octokit.pulls.get({
-      owner: this.owner,
-      repo: this.repo,
-      pull_number: prNumber,
-    });
+    const { data } = await withRetry(() =>
+      this.octokit.pulls.get({
+        owner: this.owner,
+        repo: this.repo,
+        pull_number: prNumber,
+      })
+    );
     return { state: data.state, head: { ref: data.head.ref }, title: data.title };
   }
 
@@ -69,13 +68,15 @@ export class GitHubService {
     branch: string,
     triggeredAfter: Date
   ): Promise<{ id: number; status: string; conclusion: string | null } | null> {
-    const { data } = await this.octokit.actions.listWorkflowRuns({
-      owner: this.owner,
-      repo: this.repo,
-      workflow_id: workflowFile,
-      branch,
-      per_page: 5,
-    });
+    const { data } = await withRetry(() =>
+      this.octokit.actions.listWorkflowRuns({
+        owner: this.owner,
+        repo: this.repo,
+        workflow_id: workflowFile,
+        branch,
+        per_page: 5,
+      })
+    );
 
     const cutoff = triggeredAfter.toISOString();
     const run = data.workflow_runs.find((r) => r.created_at >= cutoff);
@@ -87,21 +88,25 @@ export class GitHubService {
   async getWorkflowRunStatus(
     runId: number
   ): Promise<{ status: string; conclusion: string | null }> {
-    const { data } = await this.octokit.actions.getWorkflowRun({
-      owner: this.owner,
-      repo: this.repo,
-      run_id: runId,
-    });
+    const { data } = await withRetry(() =>
+      this.octokit.actions.getWorkflowRun({
+        owner: this.owner,
+        repo: this.repo,
+        run_id: runId,
+      })
+    );
     return { status: data.status ?? '', conclusion: data.conclusion ?? null };
   }
 
   async getFailedJobLogs(runId: number): Promise<string> {
-    const { data: jobsData } = await this.octokit.actions.listJobsForWorkflowRun({
-      owner: this.owner,
-      repo: this.repo,
-      run_id: runId,
-      filter: 'latest',
-    });
+    const { data: jobsData } = await withRetry(() =>
+      this.octokit.actions.listJobsForWorkflowRun({
+        owner: this.owner,
+        repo: this.repo,
+        run_id: runId,
+        filter: 'latest',
+      })
+    );
 
     const failedJobs = jobsData.jobs.filter((j) => j.conclusion === 'failure');
     if (failedJobs.length === 0) return 'No failed jobs found.';
@@ -109,11 +114,13 @@ export class GitHubService {
     const logs: string[] = [];
     for (const job of failedJobs) {
       try {
-        const { data } = await this.octokit.actions.downloadJobLogsForWorkflowRun({
-          owner: this.owner,
-          repo: this.repo,
-          job_id: job.id,
-        });
+        const { data } = await withRetry(() =>
+          this.octokit.actions.downloadJobLogsForWorkflowRun({
+            owner: this.owner,
+            repo: this.repo,
+            job_id: job.id,
+          })
+        );
         const logText = typeof data === 'string' ? data : String(data);
         const lines = logText.split('\n');
         const tail = lines.slice(-200).join('\n');
@@ -126,13 +133,26 @@ export class GitHubService {
     return logs.join('\n\n');
   }
 
-  async deleteBranch(branchName: string): Promise<void> {
-    try {
-      await this.octokit.git.deleteRef({
+  async closePullRequest(prNumber: number): Promise<void> {
+    await withRetry(() =>
+      this.octokit.pulls.update({
         owner: this.owner,
         repo: this.repo,
-        ref: `heads/${branchName}`,
-      });
+        pull_number: prNumber,
+        state: 'closed',
+      })
+    );
+  }
+
+  async deleteBranch(branchName: string): Promise<void> {
+    try {
+      await withRetry(() =>
+        this.octokit.git.deleteRef({
+          owner: this.owner,
+          repo: this.repo,
+          ref: `heads/${branchName}`,
+        })
+      );
     } catch {
       // Branch might already be deleted
     }

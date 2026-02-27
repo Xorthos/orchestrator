@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 
 const MIGRATIONS = [
   `ALTER TABLE tasks ADD COLUMN creator_account_id TEXT`,
+  `ALTER TABLE tasks ADD COLUMN worktree_path TEXT`,
 ];
 
 export class StateManager {
@@ -93,6 +94,49 @@ export class StateManager {
 
   getAllTasks(): TaskRow[] {
     return this.db.prepare('SELECT * FROM tasks').all() as TaskRow[];
+  }
+
+  getTaskByPrNumber(prNumber: number): TaskRow | null {
+    const row = this.db
+      .prepare('SELECT * FROM tasks WHERE pr_number = ?')
+      .get(prNumber) as TaskRow | undefined;
+    return row ?? null;
+  }
+
+  getStaleTasks(thresholdHours: number): TaskRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM tasks WHERE updated_at < datetime('now', '-' || ? || ' hours') AND phase NOT IN ('failed')`
+      )
+      .all(thresholdHours) as TaskRow[];
+  }
+
+  getStats(): {
+    total: number;
+    byPhase: Record<string, number>;
+    totalCostUsd: number;
+    tasks: Array<Pick<TaskRow, 'issue_key' | 'phase' | 'summary' | 'cost_usd' | 'created_at' | 'updated_at'>>;
+  } {
+    const byPhase = this.db
+      .prepare('SELECT phase, COUNT(*) as count FROM tasks GROUP BY phase')
+      .all() as Array<{ phase: string; count: number }>;
+
+    const costRow = this.db
+      .prepare('SELECT COALESCE(SUM(cost_usd), 0) as total FROM tasks')
+      .get() as { total: number };
+
+    const tasks = this.db
+      .prepare(
+        'SELECT issue_key, phase, summary, cost_usd, created_at, updated_at FROM tasks ORDER BY updated_at DESC LIMIT 20'
+      )
+      .all() as Array<Pick<TaskRow, 'issue_key' | 'phase' | 'summary' | 'cost_usd' | 'created_at' | 'updated_at'>>;
+
+    return {
+      total: byPhase.reduce((sum, r) => sum + r.count, 0),
+      byPhase: Object.fromEntries(byPhase.map((r) => [r.phase, r.count])),
+      totalCostUsd: costRow.total,
+      tasks,
+    };
   }
 
   deleteTask(issueKey: string): void {

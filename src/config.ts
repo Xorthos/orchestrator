@@ -51,12 +51,20 @@ export function loadConfig() {
       maxTurnsImplement: optionalInt('CLAUDE_MAX_TURNS_IMPLEMENT', 200),
       maxBudgetPlan: parseFloat(process.env.CLAUDE_MAX_BUDGET_PLAN || '2'),
       maxBudgetImplement: parseFloat(process.env.CLAUDE_MAX_BUDGET_IMPLEMENT || '10'),
+      maxConcurrentTasks: optionalInt('MAX_CONCURRENT_TASKS', 1),
     },
     webhook: {
       port: optionalInt('WEBHOOK_PORT', 3000),
       secret: process.env.WEBHOOK_SECRET || null,
+      githubSecret: process.env.GITHUB_WEBHOOK_SECRET || null,
+      statusApiToken: process.env.STATUS_API_TOKEN || null,
     },
     reconciliationInterval: optionalInt('RECONCILIATION_INTERVAL', 300),
+    staleTaskHours: optionalInt('STALE_TASK_HOURS', 48),
+    teamsWebhookUrl: process.env.TEAMS_WEBHOOK_URL || null,
+    notificationEvents: process.env.NOTIFICATION_EVENTS
+      ? new Set(process.env.NOTIFICATION_EVENTS.split(',').map((s) => s.trim()))
+      : null,
     logLevel: optional('LOG_LEVEL', 'info'),
   } as const;
 }

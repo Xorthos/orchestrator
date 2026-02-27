@@ -1,10 +1,12 @@
 import type { Config } from './config.js';
-import type { JiraWebhookPayload } from './types.js';
+import type { JiraWebhookPayload, GitHubWebhookPayload } from './types.js';
 import { Logger } from './logger.js';
 import { StateManager } from './services/state.js';
 import { JiraService } from './services/jira.js';
 import { GitHubService } from './services/github.js';
 import { ClaudeService } from './services/claude.js';
+import { Notifier } from './services/notifier.js';
+import { classifyError } from './utils/errors.js';
 
 export class WorkflowEngine {
   private processing = new Set<string>();
@@ -15,8 +17,17 @@ export class WorkflowEngine {
     private state: StateManager,
     private jira: JiraService,
     private github: GitHubService,
-    private claude: ClaudeService
+    private claude: ClaudeService,
+    private notifier: Notifier
   ) {}
+
+  getStatus() {
+    return {
+      processing: this.processing.size,
+      processingKeys: Array.from(this.processing),
+      stats: this.state.getStats(),
+    };
+  }
 
   private getAssignBackId(issueKey: string): string | null {
     const taskState = this.state.getTask(issueKey);
@@ -48,10 +59,15 @@ export class WorkflowEngine {
     const labels = issue.fields.labels ?? [];
     const assigneeId = issue.fields.assignee?.accountId ?? null;
 
-    // Check if status changed to "Done" via changelog
+    // Check status changes via changelog
     const statusChange = payload.changelog?.items.find((item) => item.field === 'status');
-    if (statusChange?.toString?.toLowerCase() === 'done') {
+    const newStatus = statusChange?.toString?.toLowerCase();
+    if (newStatus === 'done') {
       await this.handleMerge(issueKey);
+      return;
+    }
+    if (newStatus === 'cancelled' || newStatus === 'closed') {
+      await this.handleCancellation(issueKey);
       return;
     }
 
@@ -110,7 +126,7 @@ export class WorkflowEngine {
   private async handleNewTask(issue: { key: string; fields: { summary: string; description?: unknown; reporter?: { accountId: string } | null } }): Promise<void> {
     const issueKey = issue.key;
     const summary = issue.fields.summary;
-    const description = this.jira.descriptionToText(issue.fields.description);
+    let description = this.jira.descriptionToText(issue.fields.description);
     const creatorAccountId = issue.fields.reporter?.accountId ?? null;
 
     if (this.processing.has(issueKey)) return;
@@ -127,6 +143,13 @@ export class WorkflowEngine {
         issueKey,
         `\u{1F916} Claude is analyzing this task and creating an implementation plan...`
       );
+
+      // Fetch and include attachment content
+      const attachmentContext = await this.jira.getAttachmentContext(issueKey);
+      if (attachmentContext) {
+        description += attachmentContext;
+        this.log.info(`${issueKey} \u2192 Included attachment context`);
+      }
 
       this.log.info(`${issueKey} \u2192 Claude is planning...`);
       const result = await this.claude.createPlan(issueKey, summary, description);
@@ -185,6 +208,11 @@ export class WorkflowEngine {
         });
 
         this.log.success(`${issueKey} \u2192 Plan posted. Waiting for your approval.`);
+        await this.notifier.notify('plan-ready', {
+          issueKey, summary,
+          message: 'Implementation plan ready for review',
+          url: `${this.jira.getBaseUrl()}/browse/${issueKey}`,
+        });
       }
     } catch (error) {
       this.log.error(`${issueKey} \u2192 Planning failed: ${(error as Error).message}`);
@@ -343,6 +371,10 @@ export class WorkflowEngine {
 
   private async handleImplementation(issueKey: string): Promise<void> {
     if (this.processing.has(issueKey)) return;
+    if (!this.claude.canAcceptTask()) {
+      this.log.info(`${issueKey} \u2192 Max concurrent tasks reached, deferring...`);
+      return;
+    }
     this.processing.add(issueKey);
 
     const taskState = this.state.getTask(issueKey);
@@ -353,6 +385,7 @@ export class WorkflowEngine {
     this.log.task(`[IMPLEMENT] ${issueKey}: ${summary}`);
 
     let branchName: string | undefined;
+    let worktreePath: string | undefined;
 
     try {
       await this.jira.addComment(issueKey, `\u{1F916} Plan approved \u2014 starting implementation...`);
@@ -361,8 +394,10 @@ export class WorkflowEngine {
         await this.jira.assignIssue(issueKey, this.config.jira.claudeAccountId);
       }
 
-      branchName = this.claude.createBranch(issueKey, summary);
-      this.log.info(`${issueKey} \u2192 Branch: ${branchName}`);
+      const branchInfo = this.claude.createBranch(issueKey, summary);
+      branchName = branchInfo.branchName;
+      worktreePath = branchInfo.worktreePath;
+      this.log.info(`${issueKey} \u2192 Branch: ${branchName} (worktree: ${worktreePath})`);
 
       this.log.info(`${issueKey} \u2192 Claude is coding...`);
       const result = await this.claude.implementPlan(
@@ -370,7 +405,8 @@ export class WorkflowEngine {
         summary,
         description,
         plan ?? '',
-        reviewer_notes
+        reviewer_notes,
+        worktreePath
       );
 
       if (!result.success) {
@@ -378,17 +414,17 @@ export class WorkflowEngine {
       }
 
       this.log.info(`${issueKey} \u2192 Pushing changes...`);
-      const pushResult = this.claude.pushChanges(issueKey, summary, branchName);
+      const pushResult = this.claude.pushChanges(issueKey, summary, branchName, worktreePath);
 
       if (!pushResult.pushed) {
         throw new Error(`No changes to push: ${pushResult.reason}`);
       }
 
       this.log.info(`${issueKey} \u2192 Merging into staging...`);
-      this.claude.mergeIntoStaging(branchName);
+      await this.claude.mergeIntoStaging(branchName);
       this.log.success(`${issueKey} \u2192 Staging branch updated and pushed`);
 
-      await this.waitForStagingWorkflow(issueKey, branchName, summary, taskState);
+      await this.waitForStagingWorkflow(issueKey, branchName, summary, taskState, worktreePath);
 
       this.log.info(`${issueKey} \u2192 Smoke testing staging...`);
       const testResult = await this.claude.smokeTestStaging();
@@ -442,22 +478,44 @@ export class WorkflowEngine {
       });
 
       this.log.success(`${issueKey} \u2192 In Test. PR: ${pr.html_url}`);
+      await this.notifier.notify('implementation-done', {
+        issueKey, summary,
+        message: `Implementation complete. PR: ${pr.html_url}`,
+        url: pr.html_url,
+      });
     } catch (error) {
-      this.log.error(`${issueKey} \u2192 Implementation failed: ${(error as Error).message}`);
+      const errorMsg = (error as Error).message;
+      const category = classifyError(error);
+      this.log.error(`${issueKey} \u2192 Implementation failed [${category}]: ${errorMsg}`);
 
-      await this.jira.addComment(
-        issueKey,
-        `\u{1F916}\u274C Implementation error:\n\n${(error as Error).message}\n\nPlease review and retry or handle manually.`
-      );
+      if (category === 'transient') {
+        this.log.warn(`${issueKey} \u2192 Transient error, will retry on next reconciliation`);
+        this.state.upsertTask(issueKey, { phase: 'approved' });
+      } else {
+        let comment = `\u{1F916}\u274C Implementation error:\n\n${errorMsg}`;
+        if (category === 'conflict') {
+          comment += `\n\nMerge conflict detected. Please resolve manually on branch \`${branchName}\`.`;
+        } else if (category === 'budget') {
+          comment += `\n\nClaude budget limit reached. Consider increasing \`CLAUDE_MAX_BUDGET_IMPLEMENT\` or splitting the task.`;
+        } else {
+          comment += `\n\nPlease review and retry or handle manually.`;
+        }
 
-      const implErrAssignId = this.getAssignBackId(issueKey);
-      if (implErrAssignId) {
-        await this.jira.assignIssue(issueKey, implErrAssignId);
+        await this.jira.addComment(issueKey, comment);
+
+        const implErrAssignId = this.getAssignBackId(issueKey);
+        if (implErrAssignId) {
+          await this.jira.assignIssue(issueKey, implErrAssignId);
+        }
+
+        this.state.upsertTask(issueKey, { phase: 'failed' });
+        await this.notifier.notify('failed', {
+          issueKey, summary,
+          message: `Implementation failed [${category}]: ${errorMsg}`,
+        });
       }
-
-      this.state.upsertTask(issueKey, { phase: 'failed' });
     } finally {
-      this.claude.cleanup();
+      this.claude.cleanupWorktree(issueKey);
       this.processing.delete(issueKey);
     }
   }
@@ -473,6 +531,8 @@ export class WorkflowEngine {
     this.log.info(`${issueKey} \u2192 Test feedback received, starting rework...`);
     this.processing.add(issueKey);
 
+    let worktreePath: string | undefined;
+
     try {
       await this.jira.addComment(
         issueKey,
@@ -483,6 +543,8 @@ export class WorkflowEngine {
         await this.jira.assignIssue(issueKey, this.config.jira.claudeAccountId);
       }
 
+      worktreePath = this.claude.prepareReworkWorktree(issueKey, taskState.branch_name);
+
       const result = await this.claude.rework(
         issueKey,
         taskState.summary,
@@ -490,14 +552,15 @@ export class WorkflowEngine {
         taskState.plan ?? '',
         feedback,
         taskState.branch_name,
-        taskState.session_id
+        taskState.session_id,
+        worktreePath
       );
 
       if (!result.success) {
         throw new Error(`Rework failed: ${result.error}`);
       }
 
-      const pushResult = this.claude.pushRework(issueKey, taskState.branch_name, feedback);
+      const pushResult = this.claude.pushRework(issueKey, taskState.branch_name, feedback, worktreePath);
 
       if (!pushResult.pushed) {
         await this.jira.addComment(
@@ -510,9 +573,9 @@ export class WorkflowEngine {
       }
 
       this.log.info(`${issueKey} \u2192 Merging fixes into staging...`);
-      this.claude.mergeIntoStaging(taskState.branch_name);
+      await this.claude.mergeIntoStaging(taskState.branch_name);
 
-      await this.waitForStagingWorkflow(issueKey, taskState.branch_name, taskState.summary, taskState);
+      await this.waitForStagingWorkflow(issueKey, taskState.branch_name, taskState.summary, taskState, worktreePath);
 
       const testResult = await this.claude.smokeTestStaging();
       const testNote = testResult.tested
@@ -553,7 +616,7 @@ export class WorkflowEngine {
         await this.jira.assignIssue(issueKey, testErrAssignId);
       }
     } finally {
-      this.claude.cleanup();
+      this.claude.cleanupWorktree(issueKey);
       this.processing.delete(issueKey);
     }
   }
@@ -593,7 +656,8 @@ export class WorkflowEngine {
     issueKey: string,
     branchName: string,
     summary: string,
-    taskState: { cost_usd?: number | null }
+    taskState: { cost_usd?: number | null },
+    worktreePath?: string
   ): Promise<void> {
     const workflowFile = this.config.github.actionsWorkflowFile;
     if (!workflowFile) return; // backward-compatible: no polling if not configured
@@ -650,19 +714,19 @@ export class WorkflowEngine {
         `🤖 GitHub Actions workflow failed. Claude is attempting an auto-fix (attempt ${attempt}/${maxRetries})...`
       );
 
-      const fixResult = await this.claude.fixBuildFailure(issueKey, summary, branchName, logs, attempt);
+      const fixResult = await this.claude.fixBuildFailure(issueKey, summary, branchName, logs, attempt, worktreePath ?? '');
       if (!fixResult.success) {
         throw new Error(`Build fix failed: ${fixResult.error}`);
       }
 
-      const pushResult = this.claude.pushBuildFix(issueKey, branchName, attempt);
+      const pushResult = this.claude.pushBuildFix(issueKey, branchName, attempt, worktreePath ?? '');
       if (!pushResult.pushed) {
         throw new Error(`Build fix produced no changes: ${pushResult.reason}`);
       }
 
       // Re-merge into staging
       this.log.info(`${issueKey} → Re-merging fixed branch into staging...`);
-      this.claude.mergeIntoStaging(branchName);
+      await this.claude.mergeIntoStaging(branchName);
       this.log.info(`${issueKey} → Re-merged into staging, polling workflow again...`);
     }
   }
@@ -715,12 +779,69 @@ export class WorkflowEngine {
       this.state.deleteTask(issueKey);
 
       this.log.success(`${issueKey} \u2192 PR #${prNumber} merged! Deploying to production.`);
+      await this.notifier.notify('merged', {
+        issueKey, summary: pr.title,
+        message: `PR #${prNumber} merged to ${this.claude.getDefaultBranch()}. Production deploy triggered.`,
+      });
     } catch (error) {
       this.log.error(`${issueKey} \u2192 Merge failed: ${(error as Error).message}`);
       await this.jira.addComment(issueKey, `\u{1F916}\u274C Auto-merge failed: ${(error as Error).message}\n\nPlease merge manually.`);
     } finally {
       this.processing.delete(mergeKey);
     }
+  }
+
+  // ── GitHub Webhook Handler ──────────────────────────────────
+
+  async handleGitHubWebhook(event: string, payload: GitHubWebhookPayload): Promise<void> {
+    if (event === 'pull_request_review' && payload.action === 'submitted') {
+      await this.handlePRReview(payload);
+    }
+  }
+
+  private async handlePRReview(payload: GitHubWebhookPayload): Promise<void> {
+    const prNumber = payload.pull_request?.number;
+    if (!prNumber) return;
+
+    const task = this.state.getTaskByPrNumber(prNumber);
+    if (!task || task.phase !== 'test') return;
+
+    const review = payload.review;
+    if (!review) return;
+
+    if (review.state === 'changes_requested' && review.body) {
+      this.log.info(`${task.issue_key} \u2190 GitHub PR review: changes requested by @${review.user.login}`);
+      await this.handleTestFeedback(
+        task.issue_key,
+        `[GitHub PR Review by @${review.user.login}]: ${review.body}`
+      );
+    } else if (review.state === 'approved') {
+      this.log.info(`${task.issue_key} \u2190 GitHub PR approved by @${review.user.login}`);
+      await this.jira.addComment(
+        task.issue_key,
+        `\u{1F916} PR #${prNumber} approved by @${review.user.login} on GitHub. ` +
+          `Move this task to **"Done"** to merge & deploy to production.`
+      );
+    }
+  }
+
+  // ── Task Cancellation ─────────────────────────────────────
+
+  private async handleCancellation(issueKey: string): Promise<void> {
+    const task = this.state.getTask(issueKey);
+    if (!task) return;
+
+    this.log.info(`${issueKey} \u2192 Cancelled. Cleaning up...`);
+
+    if (task.pr_number) {
+      try { await this.github.closePullRequest(task.pr_number); } catch { /* best effort */ }
+    }
+    if (task.branch_name) {
+      try { await this.github.deleteBranch(task.branch_name); } catch { /* best effort */ }
+    }
+
+    this.state.deleteTask(issueKey);
+    this.log.success(`${issueKey} \u2192 Cleanup complete.`);
   }
 
   // ── Reconciliation Poll ────────────────────────────────────
@@ -848,6 +969,37 @@ export class WorkflowEngine {
       const approvedTasks = await this.jira.findApprovedTasks(this.config.jira.claudeLabel);
       for (const issue of approvedTasks) {
         await this.handleMerge((issue as any).key);
+      }
+
+      // 6. Detect stale tasks
+      const staleHours = this.config.staleTaskHours;
+      if (staleHours > 0) {
+        const staleTasks = this.state.getStaleTasks(staleHours);
+        for (const task of staleTasks) {
+          this.log.warn(
+            `${task.issue_key} stuck in "${task.phase}" for >${staleHours}h — consider manual intervention`
+          );
+        }
+      }
+
+      // 7. Check for cancelled/deleted tasks in Jira (orphan cleanup)
+      const allTracked = this.state.getAllTasks();
+      for (const task of allTracked) {
+        if (this.processing.has(task.issue_key)) continue;
+        try {
+          const issue = await this.jira.getIssue(task.issue_key);
+          const jiraStatus = (issue.fields as any).status?.name?.toLowerCase();
+          if (jiraStatus === 'cancelled' || jiraStatus === 'closed') {
+            await this.handleCancellation(task.issue_key);
+          }
+        } catch (error) {
+          const msg = (error as Error).message;
+          // If issue was deleted (404), clean up
+          if (msg.includes('404') || msg.includes('does not exist') || msg.includes('not found')) {
+            this.log.warn(`${task.issue_key} \u2192 Issue not found in Jira, cleaning up`);
+            this.state.deleteTask(task.issue_key);
+          }
+        }
       }
     } catch (error) {
       this.log.error(`Reconciliation error: ${(error as Error).message}`);

@@ -1,13 +1,19 @@
 import { execSync } from 'child_process';
-import { writeFileSync, unlinkSync } from 'fs';
+import { writeFileSync, unlinkSync, mkdirSync, existsSync } from 'fs';
 import { join } from 'path';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import type { Config } from '../config.js';
 import type { ClaudeResult, PlanResult } from '../types.js';
 import { Logger } from '../logger.js';
 
+export interface BranchInfo {
+  branchName: string;
+  worktreePath: string;
+}
+
 export class ClaudeService {
   private repoPath: string;
+  private worktreeBase: string;
   private defaultBranch = 'main';
   private stagingUrl: string | null;
   private useMaxSubscription: boolean;
@@ -15,16 +21,21 @@ export class ClaudeService {
   private maxTurnsImplement: number;
   private maxBudgetPlan: number;
   private maxBudgetImplement: number;
+  private maxConcurrentTasks: number;
+  private activeWorktrees = new Map<string, string>(); // issueKey -> worktreePath
+  private stagingLock = false;
   private log: Logger;
 
   constructor(config: Config['claude'], log: Logger) {
     this.repoPath = config.repoPath;
+    this.worktreeBase = join(config.repoPath, '..', '.orchestrator-worktrees');
     this.stagingUrl = config.stagingUrl;
     this.useMaxSubscription = config.useMaxSubscription;
     this.maxTurnsPlan = config.maxTurnsPlan;
     this.maxTurnsImplement = config.maxTurnsImplement;
     this.maxBudgetPlan = config.maxBudgetPlan;
     this.maxBudgetImplement = config.maxBudgetImplement;
+    this.maxConcurrentTasks = config.maxConcurrentTasks;
     this.log = log;
   }
 
@@ -36,17 +47,25 @@ export class ClaudeService {
     return this.defaultBranch;
   }
 
+  canAcceptTask(): boolean {
+    return this.activeWorktrees.size < this.maxConcurrentTasks;
+  }
+
   // ── Git Operations ──────────────────────────────────────────
 
   git(args: string): string {
+    return this.gitAt(this.repoPath, args);
+  }
+
+  private gitAt(cwd: string, args: string): string {
     return execSync(`git ${args}`, {
-      cwd: this.repoPath,
+      cwd,
       encoding: 'utf-8',
       timeout: 30000,
     }).trim();
   }
 
-  createBranch(issueKey: string, summary: string): string {
+  createBranch(issueKey: string, summary: string): BranchInfo {
     const slug = summary
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, '-')
@@ -54,81 +73,105 @@ export class ClaudeService {
       .substring(0, 40);
 
     const branchName = `claude/${issueKey}-${slug}`;
+    const worktreePath = join(this.worktreeBase, branchName.replace(/\//g, '-'));
 
-    this.git(`checkout ${this.defaultBranch}`);
-    this.git(`pull origin ${this.defaultBranch}`);
-
-    try {
-      this.git(`branch -d ${branchName}`);
-    } catch {
-      // Branch didn't exist or has unmerged work
+    // Ensure worktree base exists
+    if (!existsSync(this.worktreeBase)) {
+      mkdirSync(this.worktreeBase, { recursive: true });
     }
-    this.git(`checkout -b ${branchName}`);
 
-    return branchName;
+    // Clean up stale worktree if it exists
+    try {
+      this.git(`worktree remove "${worktreePath}" --force`);
+    } catch { /* didn't exist */ }
+
+    // Fetch latest and clean up old branch if exists
+    this.git(`fetch origin ${this.defaultBranch}`);
+    try {
+      this.git(`branch -D ${branchName}`);
+    } catch { /* didn't exist */ }
+
+    // Create worktree with new branch based on latest default
+    this.git(`worktree add "${worktreePath}" -b ${branchName} origin/${this.defaultBranch}`);
+    this.activeWorktrees.set(issueKey, worktreePath);
+
+    return { branchName, worktreePath };
   }
 
-  pushChanges(issueKey: string, summary: string, branchName: string): { pushed: boolean; reason?: string } {
-    const status = this.git('status --porcelain');
+  pushChanges(issueKey: string, summary: string, branchName: string, worktreePath: string): { pushed: boolean; reason?: string } {
+    const status = this.gitAt(worktreePath, 'status --porcelain');
     if (!status) {
       return { pushed: false, reason: 'No changes made' };
     }
 
-    this.git('add -A');
+    this.gitAt(worktreePath, 'add -A');
 
     const commitMsg = `${issueKey}: ${summary}\n\nImplemented by Claude Code automation.\nJira: ${issueKey}`;
-    const msgFile = join(this.repoPath, '.git', 'CLAUDE_COMMIT_MSG');
+    const msgFile = join(worktreePath, '.git-commit-msg');
     writeFileSync(msgFile, commitMsg);
-    this.git(`commit -F "${msgFile}"`);
+    this.gitAt(worktreePath, `commit -F "${msgFile}"`);
     unlinkSync(msgFile);
 
-    this.git(`push -u origin ${branchName}`);
+    this.gitAt(worktreePath, `push -u origin ${branchName}`);
     return { pushed: true };
   }
 
-  pushRework(issueKey: string, branchName: string, feedback: string): { pushed: boolean; reason?: string } {
-    const status = this.git('status --porcelain');
+  pushRework(issueKey: string, branchName: string, feedback: string, worktreePath: string): { pushed: boolean; reason?: string } {
+    const status = this.gitAt(worktreePath, 'status --porcelain');
     if (!status) {
       return { pushed: false, reason: 'No changes made during rework' };
     }
 
-    this.git('add -A');
+    this.gitAt(worktreePath, 'add -A');
 
     const commitMsg = `${issueKey}: Address review feedback\n\nFeedback: ${feedback.substring(0, 200)}\n\nJira: ${issueKey}`;
-    const msgFile = join(this.repoPath, '.git', 'CLAUDE_COMMIT_MSG');
+    const msgFile = join(worktreePath, '.git-commit-msg');
     writeFileSync(msgFile, commitMsg);
-    this.git(`commit -F "${msgFile}"`);
+    this.gitAt(worktreePath, `commit -F "${msgFile}"`);
     unlinkSync(msgFile);
 
-    this.git(`push origin ${branchName}`);
+    this.gitAt(worktreePath, `push origin ${branchName}`);
     return { pushed: true };
   }
 
-  mergeIntoStaging(branchName: string): boolean {
+  /** Merge a feature branch into staging. Uses the main repo with a lock to serialize staging merges. */
+  async mergeIntoStaging(branchName: string): Promise<boolean> {
+    // Wait for staging lock (simple spin — staging merges are fast)
+    while (this.stagingLock) {
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    this.stagingLock = true;
+
     try {
-      this.git('fetch origin staging');
-      this.git('checkout staging');
-      this.git('pull origin staging');
-    } catch {
+      this.git(`fetch origin ${branchName}`);
+
+      try {
+        this.git('fetch origin staging');
+        this.git('checkout staging');
+        this.git('pull origin staging');
+      } catch {
+        this.git(`checkout ${this.defaultBranch}`);
+        this.git(`pull origin ${this.defaultBranch}`);
+        this.git('checkout -b staging');
+      }
+
+      try {
+        this.git(`merge origin/${branchName} --no-edit`);
+      } catch {
+        this.git('merge --abort');
+        this.git(`checkout ${this.defaultBranch}`);
+        throw new Error(
+          `Merge conflict when merging ${branchName} into staging. ` +
+          `Please resolve manually or simplify the changes.`
+        );
+      }
+
+      this.git('push -u origin staging');
       this.git(`checkout ${this.defaultBranch}`);
-      this.git(`pull origin ${this.defaultBranch}`);
-      this.git('checkout -b staging');
+      return true;
+    } finally {
+      this.stagingLock = false;
     }
-
-    try {
-      this.git(`merge ${branchName} --no-edit`);
-    } catch {
-      this.git('merge --abort');
-      this.git(`checkout ${branchName}`);
-      throw new Error(
-        `Merge conflict when merging ${branchName} into staging. ` +
-        `Please resolve manually or simplify the changes.`
-      );
-    }
-
-    this.git('push -u origin staging');
-    this.git(`checkout ${branchName}`);
-    return true;
   }
 
   async smokeTestStaging(): Promise<{ tested: boolean; passed?: boolean; output?: string; reason?: string }> {
@@ -161,10 +204,10 @@ export class ClaudeService {
     summary: string,
     branchName: string,
     failedJobLogs: string,
-    attempt: number
+    attempt: number,
+    worktreePath: string
   ): Promise<ClaudeResult> {
-    this.git(`checkout ${branchName}`);
-    this.git(`pull origin ${branchName}`);
+    this.gitAt(worktreePath, `pull origin ${branchName}`);
 
     const prompt = `You are fixing a GitHub Actions build failure for Jira task ${issueKey} (attempt ${attempt}).
 
@@ -188,28 +231,68 @@ ${failedJobLogs}
       maxTurns: this.maxTurnsImplement,
       maxBudgetUsd: this.maxBudgetImplement,
       permissionMode: 'acceptEdits',
+      cwd: worktreePath,
     });
   }
 
-  pushBuildFix(issueKey: string, branchName: string, attempt: number): { pushed: boolean; reason?: string } {
-    const status = this.git('status --porcelain');
+  pushBuildFix(issueKey: string, branchName: string, attempt: number, worktreePath: string): { pushed: boolean; reason?: string } {
+    const status = this.gitAt(worktreePath, 'status --porcelain');
     if (!status) {
       return { pushed: false, reason: 'No changes made by build fix' };
     }
 
-    this.git('add -A');
+    this.gitAt(worktreePath, 'add -A');
 
     const commitMsg = `${issueKey}: Fix build failure (attempt ${attempt})\n\nAutomated build fix by Claude Code.\nJira: ${issueKey}`;
-    const msgFile = join(this.repoPath, '.git', 'CLAUDE_COMMIT_MSG');
+    const msgFile = join(worktreePath, '.git-commit-msg');
     writeFileSync(msgFile, commitMsg);
-    this.git(`commit -F "${msgFile}"`);
+    this.gitAt(worktreePath, `commit -F "${msgFile}"`);
     unlinkSync(msgFile);
 
-    this.git(`push origin ${branchName}`);
+    this.gitAt(worktreePath, `push origin ${branchName}`);
     return { pushed: true };
   }
 
+  /** Prepare a worktree for rework on an existing branch */
+  prepareReworkWorktree(issueKey: string, branchName: string): string {
+    const worktreePath = join(this.worktreeBase, branchName.replace(/\//g, '-'));
+
+    if (!existsSync(this.worktreeBase)) {
+      mkdirSync(this.worktreeBase, { recursive: true });
+    }
+
+    // Clean up stale worktree if it exists
+    try {
+      this.git(`worktree remove "${worktreePath}" --force`);
+    } catch { /* didn't exist */ }
+
+    this.git(`fetch origin ${branchName}`);
+
+    // Create worktree for the existing remote branch
+    try {
+      this.git(`branch -D ${branchName}`);
+    } catch { /* didn't exist locally */ }
+    this.git(`worktree add "${worktreePath}" -b ${branchName} origin/${branchName}`);
+    this.activeWorktrees.set(issueKey, worktreePath);
+
+    return worktreePath;
+  }
+
+  cleanupWorktree(issueKey: string): void {
+    const worktreePath = this.activeWorktrees.get(issueKey);
+    if (worktreePath) {
+      try {
+        this.git(`worktree remove "${worktreePath}" --force`);
+      } catch { /* best effort */ }
+      this.activeWorktrees.delete(issueKey);
+    }
+  }
+
   cleanup(): void {
+    // Clean up all active worktrees
+    for (const [issueKey] of this.activeWorktrees) {
+      this.cleanupWorktree(issueKey);
+    }
     try {
       this.git(`checkout ${this.defaultBranch}`);
     } catch {
@@ -314,7 +397,8 @@ Use Format A ONLY when the task genuinely cannot be planned without more informa
     summary: string,
     description: string,
     plan: string,
-    reviewerNotes: string | null
+    reviewerNotes: string | null,
+    worktreePath: string
   ): Promise<ClaudeResult> {
     const prompt = `You are implementing Jira task ${issueKey}. The plan was reviewed and approved.
 
@@ -342,6 +426,7 @@ Provide a brief summary of what was changed when done.`;
       maxTurns: this.maxTurnsImplement,
       maxBudgetUsd: this.maxBudgetImplement,
       permissionMode: 'acceptEdits',
+      cwd: worktreePath,
     });
   }
 
@@ -352,11 +437,9 @@ Provide a brief summary of what was changed when done.`;
     plan: string,
     feedback: string,
     branchName: string,
-    sessionId: string | null
+    sessionId: string | null,
+    worktreePath: string
   ): Promise<ClaudeResult> {
-    this.git(`checkout ${branchName}`);
-    this.git(`pull origin ${branchName}`);
-
     const prompt = `You are fixing Jira task ${issueKey} based on test feedback.
 The implementation was done previously on this branch, but the reviewer found issues.
 
@@ -384,6 +467,8 @@ Focus specifically on addressing the feedback. Provide a brief summary of what y
       maxTurns: this.maxTurnsImplement,
       maxBudgetUsd: this.maxBudgetImplement,
       permissionMode: 'acceptEdits',
+      ...(sessionId ? { resume: sessionId } : {}),
+      cwd: worktreePath,
     });
   }
 
@@ -395,6 +480,7 @@ Focus specifically on addressing the feedback. Provide a brief summary of what y
       permissionMode: 'plan' | 'acceptEdits' | 'dontAsk';
       allowedTools?: string[];
       resume?: string;
+      cwd?: string;
     }
   ): Promise<ClaudeResult> {
     let outputText = '';
@@ -407,7 +493,7 @@ Focus specifically on addressing the feedback. Provide a brief summary of what y
         options: {
           maxTurns: options.maxTurns,
           maxBudgetUsd: options.maxBudgetUsd,
-          cwd: this.repoPath,
+          cwd: options.cwd ?? this.repoPath,
           permissionMode: options.permissionMode,
           env: this.buildEnv(),
           stderr: (data: string) => this.log.debug(`[claude-sdk] ${data.trimEnd()}`),

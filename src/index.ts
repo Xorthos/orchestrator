@@ -5,6 +5,7 @@ import { StateManager } from './services/state.js';
 import { JiraService } from './services/jira.js';
 import { GitHubService } from './services/github.js';
 import { ClaudeService } from './services/claude.js';
+import { FigmaService } from './services/figma.js';
 import { Notifier } from './services/notifier.js';
 import { WorkflowEngine } from './workflow.js';
 import { createServer } from './server.js';
@@ -31,8 +32,10 @@ async function main() {
   log.info(`Repo path:   ${config.claude.repoPath}`);
   log.info(`Cost limits: Plan $${config.claude.maxBudgetPlan} / Implement $${config.claude.maxBudgetImplement}`);
   log.info(`Teams:       ${config.teamsWebhookUrl ? 'enabled' : 'disabled'}`);
+  log.info(`Slack:       ${config.slackWebhookUrl ? 'enabled' : 'disabled'}`);
   log.info(`GH webhook:  ${config.webhook.githubSecret ? 'enabled (HMAC)' : config.webhook.githubSecret === null ? 'enabled (no HMAC)' : 'disabled'}`);
   log.info(`Stale check: ${config.staleTaskHours > 0 ? `${config.staleTaskHours}h` : 'disabled'}`);
+  log.info(`Figma:       ${config.figma.mcpUrl ? 'enabled' : 'disabled'}`);
   console.log('');
 
   // Init services
@@ -40,12 +43,15 @@ async function main() {
   const state = new StateManager(dbPath);
   const jira = new JiraService(config.jira);
   const github = new GitHubService(config.github);
-  const claude = new ClaudeService(config.claude, log);
-  const notifier = new Notifier(config.teamsWebhookUrl, config.notificationEvents, log);
+  const claude = new ClaudeService(config.claude, config.figma, log);
+  const figma = config.figma.accessToken ? new FigmaService(config.figma.accessToken) : null;
+  const notifier = new Notifier(config.teamsWebhookUrl, config.slackWebhookUrl, config.notificationEvents, log);
 
   // Verify connections
+  let jiraBotAccountId: string | null = null;
   try {
     const me = await jira.getMyself();
+    jiraBotAccountId = (me as any).accountId ?? null;
     log.success(`Jira: ${me.displayName} (${me.emailAddress})`);
   } catch (error) {
     log.error(`Jira connection failed: ${(error as Error).message}`);
@@ -72,7 +78,10 @@ async function main() {
   console.log('');
 
   // Create workflow engine and server
-  const workflow = new WorkflowEngine(config, log, state, jira, github, claude, notifier);
+  const workflow = new WorkflowEngine(config, log, state, jira, github, claude, notifier, figma);
+  if (jiraBotAccountId) {
+    workflow.setBotAccountId(jiraBotAccountId);
+  }
   const app = createServer(config, log, workflow);
 
   // Start Express server
@@ -92,17 +101,34 @@ async function main() {
   await workflow.reconcile();
 
   // Graceful shutdown
-  function shutdown() {
-    log.info('Shutting down...');
+  let isShuttingDown = false;
+
+  async function shutdown() {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+
+    log.info('Graceful shutdown initiated...');
     clearInterval(reconcileTimer);
+    workflow.startShutdown();
+
+    const status = workflow.getStatus();
+    if (status.processing.count > 0) {
+      log.info(`Waiting for ${status.processing.count} in-progress task(s): ${status.processing.keys.join(', ')}`);
+      const remaining = await workflow.waitForCompletion(120000);
+      if (remaining.length > 0) {
+        log.warn(`Shutdown timeout: ${remaining.length} task(s) still running: ${remaining.join(', ')}`);
+      }
+    }
+
     server.close();
     state.close();
     claude.cleanup();
+    log.info('Shutdown complete.');
     process.exit(0);
   }
 
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', () => shutdown());
+  process.on('SIGTERM', () => shutdown());
 }
 
 main().catch((error) => {

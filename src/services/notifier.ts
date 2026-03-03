@@ -1,6 +1,6 @@
 import { Logger } from '../logger.js';
 
-type NotificationEvent = 'plan-ready' | 'implementation-done' | 'failed' | 'merged';
+type NotificationEvent = 'plan-ready' | 'implementation-done' | 'failed' | 'merged' | 'stale';
 
 interface NotificationData {
   issueKey: string;
@@ -10,10 +10,11 @@ interface NotificationData {
 }
 
 const EVENT_COLORS: Record<NotificationEvent, string> = {
-  'plan-ready': '0078D4',       // blue
+  'plan-ready': '0078D4',          // blue
   'implementation-done': '28A745', // green
-  'failed': 'DC3545',           // red
-  'merged': '28A745',           // green
+  'failed': 'DC3545',             // red
+  'merged': '28A745',             // green
+  'stale': 'FFC107',              // amber
 };
 
 const EVENT_TITLES: Record<NotificationEvent, string> = {
@@ -21,29 +22,39 @@ const EVENT_TITLES: Record<NotificationEvent, string> = {
   'implementation-done': 'Implementation Complete',
   'failed': 'Task Failed',
   'merged': 'PR Merged to Production',
+  'stale': 'Task Stale',
 };
 
 export class Notifier {
   constructor(
     private teamsWebhookUrl: string | null,
+    private slackWebhookUrl: string | null,
     private enabledEvents: Set<string> | null,
     private log: Logger
   ) {}
 
   async notify(event: NotificationEvent, data: NotificationData): Promise<void> {
-    if (!this.teamsWebhookUrl) return;
     if (this.enabledEvents && !this.enabledEvents.has(event)) return;
 
+    const promises: Promise<void>[] = [];
+    if (this.teamsWebhookUrl) promises.push(this.sendTeams(event, data));
+    if (this.slackWebhookUrl) promises.push(this.sendSlack(event, data));
+
+    await Promise.allSettled(promises);
+  }
+
+  // ── Teams ──────────────────────────────────────────────────
+
+  private async sendTeams(event: NotificationEvent, data: NotificationData): Promise<void> {
     try {
       const card = this.buildTeamsCard(event, data);
-      await fetch(this.teamsWebhookUrl, {
+      await fetch(this.teamsWebhookUrl!, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(card),
       });
     } catch (error) {
-      // Best effort — never fail the workflow for notification issues
-      this.log.debug(`Notification failed (${event}): ${(error as Error).message}`);
+      this.log.debug(`Teams notification failed (${event}): ${(error as Error).message}`);
     }
   }
 
@@ -79,6 +90,61 @@ export class Notifier {
         },
       ],
       potentialAction: actions.length > 0 ? actions : undefined,
+    };
+  }
+
+  // ── Slack ──────────────────────────────────────────────────
+
+  private async sendSlack(event: NotificationEvent, data: NotificationData): Promise<void> {
+    try {
+      const payload = this.buildSlackPayload(event, data);
+      await fetch(this.slackWebhookUrl!, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+    } catch (error) {
+      this.log.debug(`Slack notification failed (${event}): ${(error as Error).message}`);
+    }
+  }
+
+  private buildSlackPayload(event: NotificationEvent, data: NotificationData) {
+    const SLACK_COLORS: Record<NotificationEvent, string> = {
+      'plan-ready': '#0078D4',
+      'implementation-done': '#28A745',
+      'failed': '#DC3545',
+      'merged': '#28A745',
+      'stale': '#FFC107',
+    };
+
+    const title = EVENT_TITLES[event] ?? event;
+    const color = SLACK_COLORS[event] ?? '#6C757D';
+
+    const blocks: Array<Record<string, unknown>> = [
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: `*${data.issueKey}: ${title}*\n${data.message}`,
+        },
+      },
+    ];
+
+    if (data.url) {
+      blocks.push({
+        type: 'actions',
+        elements: [
+          {
+            type: 'button',
+            text: { type: 'plain_text', text: 'View' },
+            url: data.url,
+          },
+        ],
+      });
+    }
+
+    return {
+      attachments: [{ color, blocks }],
     };
   }
 }

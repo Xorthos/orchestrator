@@ -308,6 +308,15 @@ export class JiraService {
     return nodes;
   }
 
+  async addAttachment(issueKey: string, filename: string, content: Buffer, mimeType: string): Promise<void> {
+    await withRetry(() =>
+      this.client.issueAttachments.addAttachment({
+        issueIdOrKey: issueKey,
+        attachment: { filename, file: content, mimeType } as any,
+      })
+    );
+  }
+
   getBaseUrl(): string {
     return this.baseUrl;
   }

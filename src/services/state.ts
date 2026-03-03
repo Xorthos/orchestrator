@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import type { TaskPhase, TaskRow } from '../types.js';
+import type { TaskPhase, TaskRow, TaskHistoryRow } from '../types.js';
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS tasks (
@@ -25,6 +25,24 @@ CREATE TABLE IF NOT EXISTS tasks (
 const MIGRATIONS = [
   `ALTER TABLE tasks ADD COLUMN creator_account_id TEXT`,
   `ALTER TABLE tasks ADD COLUMN worktree_path TEXT`,
+  `ALTER TABLE tasks ADD COLUMN figma_design_url TEXT`,
+  `ALTER TABLE tasks ADD COLUMN last_stale_notified TEXT`,
+  `CREATE TABLE IF NOT EXISTS task_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_key TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    summary TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT '',
+    plan TEXT,
+    branch_name TEXT,
+    pr_number INTEGER,
+    pr_url TEXT,
+    cost_usd REAL,
+    creator_account_id TEXT,
+    outcome TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    completed_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
 ];
 
 export class StateManager {
@@ -139,8 +157,42 @@ export class StateManager {
     };
   }
 
-  deleteTask(issueKey: string): void {
+  deleteTask(issueKey: string, outcome: 'merged' | 'cancelled' | 'deleted' = 'deleted'): void {
+    const task = this.getTask(issueKey);
+    if (task) {
+      this.db.prepare(`
+        INSERT INTO task_history (issue_key, phase, summary, description, plan,
+          branch_name, pr_number, pr_url, cost_usd, creator_account_id, outcome, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        task.issue_key, task.phase, task.summary, task.description, task.plan,
+        task.branch_name, task.pr_number, task.pr_url, task.cost_usd,
+        task.creator_account_id, outcome, task.created_at
+      );
+    }
     this.db.prepare('DELETE FROM tasks WHERE issue_key = ?').run(issueKey);
+  }
+
+  getHistory(limit = 50): TaskHistoryRow[] {
+    return this.db
+      .prepare('SELECT * FROM task_history ORDER BY completed_at DESC LIMIT ?')
+      .all(limit) as TaskHistoryRow[];
+  }
+
+  getHistoryStats(): { totalCompleted: number; totalCostUsd: number; byOutcome: Record<string, number> } {
+    const byOutcome = this.db
+      .prepare('SELECT outcome, COUNT(*) as count FROM task_history GROUP BY outcome')
+      .all() as Array<{ outcome: string; count: number }>;
+
+    const costRow = this.db
+      .prepare('SELECT COALESCE(SUM(cost_usd), 0) as total FROM task_history')
+      .get() as { total: number };
+
+    return {
+      totalCompleted: byOutcome.reduce((s, r) => s + r.count, 0),
+      totalCostUsd: costRow.total,
+      byOutcome: Object.fromEntries(byOutcome.map((r) => [r.outcome, r.count])),
+    };
   }
 
   close(): void {

@@ -23,6 +23,8 @@ export interface TaskRow {
   plan_posted_at: string | null;
   creator_account_id: string | null;
   last_feedback_check: string | null;
+  last_stale_notified: string | null;
+  figma_design_url: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -87,6 +89,10 @@ export interface GitHubWebhookPayload {
     body: string;
     user: { login: string };
   };
+  issue?: {
+    number: number;
+    pull_request?: { url: string };
+  };
 }
 
 export interface ClaudeResult {
@@ -102,4 +108,23 @@ export interface PlanResult extends ClaudeResult {
   functionalSummary: string;
   hasQuestions: boolean;
   questions: string;
+  uiDesignNeeded: boolean;
+  uiDescription: string;
+}
+
+export interface TaskHistoryRow {
+  id: number;
+  issue_key: string;
+  phase: TaskPhase;
+  summary: string;
+  description: string;
+  plan: string | null;
+  branch_name: string | null;
+  pr_number: number | null;
+  pr_url: string | null;
+  cost_usd: number | null;
+  creator_account_id: string | null;
+  outcome: 'merged' | 'cancelled' | 'deleted';
+  created_at: string;
+  completed_at: string;
 }

@@ -6,10 +6,15 @@ import { JiraService } from './services/jira.js';
 import { GitHubService } from './services/github.js';
 import { ClaudeService } from './services/claude.js';
 import { Notifier } from './services/notifier.js';
+import { FigmaService } from './services/figma.js';
 import { classifyError } from './utils/errors.js';
 
 export class WorkflowEngine {
   private processing = new Set<string>();
+  private botAccountId: string | null = null;
+  private startedAt = new Date();
+  private lastReconciliationAt: Date | null = null;
+  private shuttingDown = false;
 
   constructor(
     private config: Config,
@@ -18,15 +23,59 @@ export class WorkflowEngine {
     private jira: JiraService,
     private github: GitHubService,
     private claude: ClaudeService,
-    private notifier: Notifier
+    private notifier: Notifier,
+    private figma: FigmaService | null
   ) {}
 
   getStatus() {
+    const allTasks = this.state.getAllTasks();
     return {
-      processing: this.processing.size,
-      processingKeys: Array.from(this.processing),
+      system: {
+        uptime: Math.floor((Date.now() - this.startedAt.getTime()) / 1000),
+        startedAt: this.startedAt.toISOString(),
+        lastReconciliation: this.lastReconciliationAt?.toISOString() ?? null,
+        activeWorktrees: this.claude.getActiveWorktreeCount(),
+        maxConcurrentTasks: this.config.claude.maxConcurrentTasks,
+      },
+      processing: {
+        count: this.processing.size,
+        keys: Array.from(this.processing),
+      },
+      tasks: allTasks.map((t) => ({
+        issueKey: t.issue_key,
+        phase: t.phase,
+        summary: t.summary,
+        costUsd: t.cost_usd,
+        prUrl: t.pr_url,
+        createdAt: t.created_at,
+        updatedAt: t.updated_at,
+        ageMinutes: Math.floor((Date.now() - new Date(t.created_at).getTime()) / 60000),
+      })),
       stats: this.state.getStats(),
+      history: this.state.getHistoryStats(),
     };
+  }
+
+  setBotAccountId(id: string): void {
+    this.botAccountId = id;
+  }
+
+  startShutdown(): void {
+    this.shuttingDown = true;
+  }
+
+  async waitForCompletion(timeoutMs = 60000): Promise<string[]> {
+    const start = Date.now();
+    while (this.processing.size > 0 && Date.now() - start < timeoutMs) {
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    return Array.from(this.processing);
+  }
+
+  private isBotComment(comment: { author?: { accountId: string }; body?: unknown }): boolean {
+    if (this.botAccountId && comment.author?.accountId === this.botAccountId) return true;
+    const text = this.jira.descriptionToText(comment.body).trim();
+    return text.startsWith('\u{1F916}');
   }
 
   private getAssignBackId(issueKey: string): string | null {
@@ -107,10 +156,10 @@ export class WorkflowEngine {
     const taskState = this.state.getTask(issueKey);
     if (!taskState) return;
 
-    const commentText = this.jira.descriptionToText(comment.body).trim();
-
     // Skip bot comments
-    if (commentText.startsWith('\u{1F916}')) return;
+    if (this.isBotComment(comment)) return;
+
+    const commentText = this.jira.descriptionToText(comment.body).trim();
 
     if (taskState.phase === 'planning') {
       await this.handleQuestionAnswers(issueKey, commentText);
@@ -125,6 +174,11 @@ export class WorkflowEngine {
 
   private async handleNewTask(issue: { key: string; fields: { summary: string; description?: unknown; reporter?: { accountId: string } | null } }): Promise<void> {
     const issueKey = issue.key;
+    if (this.shuttingDown) {
+      this.log.info(`${issueKey} \u2192 Rejecting: shutdown in progress`);
+      return;
+    }
+
     const summary = issue.fields.summary;
     let description = this.jira.descriptionToText(issue.fields.description);
     const creatorAccountId = issue.fields.reporter?.accountId ?? null;
@@ -183,9 +237,50 @@ export class WorkflowEngine {
 
         this.log.info(`${issueKey} \u2192 Questions posted. Waiting for answers.`);
       } else {
+        // Figma design generation (if applicable)
+        let designNote = '';
+        let figmaDesignUrl: string | null = null;
+        const figmaConfig = this.claude.getFigmaConfig();
+
+        if (result.uiDesignNeeded && figmaConfig && this.figma) {
+          this.log.info(`${issueKey} \u2192 Generating Figma design...`);
+          await this.jira.addComment(issueKey, '\u{1F916} Generating UI design in Figma...');
+
+          try {
+            const designResult = await this.claude.generateDesign(
+              issueKey,
+              summary,
+              result.uiDescription,
+              figmaConfig.fileKey
+            );
+
+            if (designResult.success) {
+              const nodeId = await this.figma.findNodeByName(figmaConfig.fileKey, issueKey);
+
+              if (nodeId) {
+                const pngBuffer = await this.figma.exportNodeAsPng(figmaConfig.fileKey, nodeId);
+                await this.jira.addAttachment(issueKey, `${issueKey}-design.png`, pngBuffer, 'image/png');
+
+                figmaDesignUrl = `https://www.figma.com/file/${figmaConfig.fileKey}?node-id=${encodeURIComponent(nodeId)}`;
+                designNote = `\n\n**UI Design:** [View in Figma](${figmaDesignUrl})\nA screenshot has been attached to this issue.`;
+                this.log.success(`${issueKey} \u2192 Figma design created and uploaded`);
+              } else {
+                this.log.warn(`${issueKey} \u2192 Figma design created but frame not found for export`);
+                designNote = '\n\n\u26A0\uFE0F UI design was generated in Figma but the frame could not be exported as a screenshot.';
+              }
+            } else {
+              this.log.warn(`${issueKey} \u2192 Figma design generation failed: ${designResult.error}`);
+              designNote = '\n\n\u26A0\uFE0F UI design generation was attempted but failed. Proceeding with text plan only.';
+            }
+          } catch (error) {
+            this.log.warn(`${issueKey} \u2192 Figma design error: ${(error as Error).message}`);
+            designNote = '\n\n\u26A0\uFE0F UI design generation was attempted but failed. Proceeding with text plan only.';
+          }
+        }
+
         await this.jira.addComment(
           issueKey,
-          `\u{1F916} **Implementation Plan:**\n\n${result.functionalSummary}\n\n` +
+          `\u{1F916} **Implementation Plan:**\n\n${result.functionalSummary}${designNote}\n\n` +
             `---\n` +
             `**To approve:** Comment \`approve\` (optionally add notes after it)\n` +
             `**To reject/modify:** Comment with your feedback and Claude will re-plan\n` +
@@ -205,6 +300,7 @@ export class WorkflowEngine {
           session_id: result.sessionId,
           cost_usd: result.costUsd,
           plan_posted_at: new Date().toISOString(),
+          figma_design_url: figmaDesignUrl,
         });
 
         this.log.success(`${issueKey} \u2192 Plan posted. Waiting for your approval.`);
@@ -370,6 +466,10 @@ export class WorkflowEngine {
   // ── Phase 2: Implement ─────────────────────────────────────
 
   private async handleImplementation(issueKey: string): Promise<void> {
+    if (this.shuttingDown) {
+      this.log.info(`${issueKey} \u2192 Rejecting: shutdown in progress`);
+      return;
+    }
     if (this.processing.has(issueKey)) return;
     if (!this.claude.canAcceptTask()) {
       this.log.info(`${issueKey} \u2192 Max concurrent tasks reached, deferring...`);
@@ -380,7 +480,7 @@ export class WorkflowEngine {
     const taskState = this.state.getTask(issueKey);
     if (!taskState) return;
 
-    const { summary, description, plan, reviewer_notes } = taskState;
+    const { summary, description, plan, reviewer_notes, figma_design_url } = taskState;
 
     this.log.task(`[IMPLEMENT] ${issueKey}: ${summary}`);
 
@@ -406,7 +506,8 @@ export class WorkflowEngine {
         description,
         plan ?? '',
         reviewer_notes,
-        worktreePath
+        worktreePath,
+        figma_design_url
       );
 
       if (!result.success) {
@@ -523,6 +624,10 @@ export class WorkflowEngine {
   // ── Phase 2b: Test Feedback / Rework ───────────────────────
 
   private async handleTestFeedback(issueKey: string, feedback: string): Promise<void> {
+    if (this.shuttingDown) {
+      this.log.info(`${issueKey} \u2192 Rejecting rework: shutdown in progress`);
+      return;
+    }
     if (this.processing.has(issueKey)) return;
 
     const taskState = this.state.getTask(issueKey);
@@ -767,7 +872,7 @@ export class WorkflowEngine {
       if (pr.state !== 'open') {
         this.log.info(`${issueKey} \u2192 PR #${prNumber} already ${pr.state}`);
         await this.jira.removeLabel(issueKey, `${this.config.jira.claudeLabel}-pr-pending`);
-        this.state.deleteTask(issueKey);
+        this.state.deleteTask(issueKey, 'merged');
         return;
       }
 
@@ -776,7 +881,7 @@ export class WorkflowEngine {
       await this.jira.addComment(issueKey, `\u{1F916}\u2705 PR #${prNumber} merged to ${this.claude.getDefaultBranch()}. Production deploy triggered.`);
 
       await this.github.deleteBranch(pr.head.ref);
-      this.state.deleteTask(issueKey);
+      this.state.deleteTask(issueKey, 'merged');
 
       this.log.success(`${issueKey} \u2192 PR #${prNumber} merged! Deploying to production.`);
       await this.notifier.notify('merged', {
@@ -796,6 +901,8 @@ export class WorkflowEngine {
   async handleGitHubWebhook(event: string, payload: GitHubWebhookPayload): Promise<void> {
     if (event === 'pull_request_review' && payload.action === 'submitted') {
       await this.handlePRReview(payload);
+    } else if (event === 'issue_comment' && payload.action === 'created') {
+      await this.handlePRComment(payload);
     }
   }
 
@@ -825,6 +932,27 @@ export class WorkflowEngine {
     }
   }
 
+  private async handlePRComment(payload: GitHubWebhookPayload): Promise<void> {
+    // Only handle comments on PRs (not plain issues)
+    if (!payload.issue?.pull_request) return;
+
+    const prNumber = payload.issue.number;
+    const task = this.state.getTaskByPrNumber(prNumber);
+    if (!task || task.phase !== 'test') return;
+
+    const comment = payload.comment;
+    if (!comment?.body) return;
+
+    // Skip bot comments
+    if (comment.body.startsWith('\u{1F916}')) return;
+
+    this.log.info(`${task.issue_key} \u2190 GitHub PR comment by @${comment.user.login}`);
+    await this.handleTestFeedback(
+      task.issue_key,
+      `[GitHub PR Comment by @${comment.user.login}]: ${comment.body}`
+    );
+  }
+
   // ── Task Cancellation ─────────────────────────────────────
 
   private async handleCancellation(issueKey: string): Promise<void> {
@@ -840,7 +968,7 @@ export class WorkflowEngine {
       try { await this.github.deleteBranch(task.branch_name); } catch { /* best effort */ }
     }
 
-    this.state.deleteTask(issueKey);
+    this.state.deleteTask(issueKey, 'cancelled');
     this.log.success(`${issueKey} \u2192 Cleanup complete.`);
   }
 
@@ -856,6 +984,10 @@ export class WorkflowEngine {
         this.config.jira.claudeLabel
       );
       for (const task of tasks) {
+        if (!this.claude.canAcceptTask()) {
+          this.log.debug('At capacity, skipping remaining new tasks');
+          break;
+        }
         await this.handleNewTask(task as any);
       }
 
@@ -871,12 +1003,12 @@ export class WorkflowEngine {
 
           for (let i = comments.length - 1; i >= 0; i--) {
             const comment = comments[i];
-            const text = this.jira.descriptionToText(comment.body).trim();
             const commentTime = new Date(comment.created).getTime();
 
-            if (text.startsWith('\u{1F916}')) continue;
+            if (this.isBotComment(comment)) continue;
             if (commentTime <= lastUpdate) break;
 
+            const text = this.jira.descriptionToText(comment.body).trim();
             await this.handleQuestionAnswers(taskState.issue_key, text);
             break;
           }
@@ -897,12 +1029,12 @@ export class WorkflowEngine {
 
           for (let i = comments.length - 1; i >= 0; i--) {
             const comment = comments[i];
-            const text = this.jira.descriptionToText(comment.body).trim();
             const commentTime = new Date(comment.created).getTime();
 
-            if (text.startsWith('\u{1F916}')) continue;
+            if (this.isBotComment(comment)) continue;
             if (commentTime <= planPostedAt) break;
 
+            const text = this.jira.descriptionToText(comment.body).trim();
             await this.handlePlanFeedback(taskState.issue_key, text);
             break;
           }
@@ -929,12 +1061,12 @@ export class WorkflowEngine {
 
           for (let i = comments.length - 1; i >= 0; i--) {
             const comment = comments[i];
-            const text = this.jira.descriptionToText(comment.body).trim();
             const commentTime = new Date(comment.created).getTime();
 
-            if (text.startsWith('\u{1F916}')) continue;
+            if (this.isBotComment(comment)) continue;
             if (commentTime <= lastCheckTime) break;
 
+            const text = this.jira.descriptionToText(comment.body).trim();
             await this.handleTestFeedback(taskState.issue_key, text);
             break;
           }
@@ -950,6 +1082,10 @@ export class WorkflowEngine {
       ];
       for (const taskState of retryableTasks) {
         if (this.processing.has(taskState.issue_key)) continue;
+        if (!this.claude.canAcceptTask()) {
+          this.log.debug('At capacity, skipping remaining retry tasks');
+          break;
+        }
 
         try {
           const issue = await this.jira.getIssue(taskState.issue_key);
@@ -971,7 +1107,7 @@ export class WorkflowEngine {
         await this.handleMerge((issue as any).key);
       }
 
-      // 6. Detect stale tasks
+      // 6. Detect stale tasks and notify
       const staleHours = this.config.staleTaskHours;
       if (staleHours > 0) {
         const staleTasks = this.state.getStaleTasks(staleHours);
@@ -979,6 +1115,23 @@ export class WorkflowEngine {
           this.log.warn(
             `${task.issue_key} stuck in "${task.phase}" for >${staleHours}h — consider manual intervention`
           );
+
+          const lastNotified = task.last_stale_notified
+            ? new Date(task.last_stale_notified).getTime()
+            : 0;
+          const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+
+          if (lastNotified < oneDayAgo) {
+            await this.notifier.notify('stale', {
+              issueKey: task.issue_key,
+              summary: task.summary,
+              message: `Task stuck in "${task.phase}" for over ${staleHours} hours. Consider manual intervention.`,
+              url: `${this.jira.getBaseUrl()}/browse/${task.issue_key}`,
+            });
+            this.state.upsertTask(task.issue_key, {
+              last_stale_notified: new Date().toISOString(),
+            });
+          }
         }
       }
 
@@ -997,10 +1150,11 @@ export class WorkflowEngine {
           // If issue was deleted (404), clean up
           if (msg.includes('404') || msg.includes('does not exist') || msg.includes('not found')) {
             this.log.warn(`${task.issue_key} \u2192 Issue not found in Jira, cleaning up`);
-            this.state.deleteTask(task.issue_key);
+            this.state.deleteTask(task.issue_key, 'deleted');
           }
         }
       }
+      this.lastReconciliationAt = new Date();
     } catch (error) {
       this.log.error(`Reconciliation error: ${(error as Error).message}`);
     }

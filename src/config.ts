@@ -62,9 +62,15 @@ export function loadConfig() {
     reconciliationInterval: optionalInt('RECONCILIATION_INTERVAL', 300),
     staleTaskHours: optionalInt('STALE_TASK_HOURS', 48),
     teamsWebhookUrl: process.env.TEAMS_WEBHOOK_URL || null,
+    slackWebhookUrl: process.env.SLACK_WEBHOOK_URL || null,
     notificationEvents: process.env.NOTIFICATION_EVENTS
       ? new Set(process.env.NOTIFICATION_EVENTS.split(',').map((s) => s.trim()))
       : null,
+    figma: {
+      mcpUrl: process.env.FIGMA_MCP_URL || null,
+      accessToken: process.env.FIGMA_ACCESS_TOKEN || null,
+      fileKey: process.env.FIGMA_FILE_KEY || null,
+    },
     logLevel: optional('LOG_LEVEL', 'info'),
   } as const;
 }

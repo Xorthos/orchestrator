@@ -26,7 +26,7 @@ export class ClaudeService {
   private stagingLock = false;
   private log: Logger;
 
-  constructor(config: Config['claude'], log: Logger) {
+  constructor(config: Config['claude'], figmaConfig: Config['figma'], log: Logger) {
     this.repoPath = config.repoPath;
     this.worktreeBase = join(config.repoPath, '..', '.orchestrator-worktrees');
     this.stagingUrl = config.stagingUrl;
@@ -36,6 +36,7 @@ export class ClaudeService {
     this.maxBudgetPlan = config.maxBudgetPlan;
     this.maxBudgetImplement = config.maxBudgetImplement;
     this.maxConcurrentTasks = config.maxConcurrentTasks;
+    this.figmaConfig = figmaConfig;
     this.log = log;
   }
 
@@ -49,6 +50,10 @@ export class ClaudeService {
 
   canAcceptTask(): boolean {
     return this.activeWorktrees.size < this.maxConcurrentTasks;
+  }
+
+  getActiveWorktreeCount(): number {
+    return this.activeWorktrees.size;
   }
 
   // ── Git Operations ──────────────────────────────────────────
@@ -300,6 +305,60 @@ ${failedJobLogs}
     }
   }
 
+  // ── Figma Design ──────────────────────────────────────────
+
+  isFigmaConfigured(): boolean {
+    return !!(this.figmaConfig.mcpUrl && this.figmaConfig.accessToken && this.figmaConfig.fileKey);
+  }
+
+  getFigmaConfig(): { mcpUrl: string; accessToken: string; fileKey: string } | null {
+    if (!this.isFigmaConfigured()) return null;
+    return this.figmaConfig as { mcpUrl: string; accessToken: string; fileKey: string };
+  }
+
+  private buildFigmaMcpServers(): Record<string, { type: 'http'; url: string; headers?: Record<string, string> }> | undefined {
+    if (!this.isFigmaConfigured()) return undefined;
+    return {
+      figma: {
+        type: 'http',
+        url: this.figmaConfig.mcpUrl!,
+        headers: { Authorization: `Bearer ${this.figmaConfig.accessToken!}` },
+      },
+    };
+  }
+
+  async generateDesign(
+    issueKey: string,
+    summary: string,
+    uiDescription: string,
+    figmaFileKey: string
+  ): Promise<ClaudeResult> {
+    const prompt = `You are a UI designer. Generate a Figma design for Jira task ${issueKey}.
+
+## Task: ${summary}
+
+## UI Description:
+${uiDescription}
+
+## Instructions:
+1. Use the Figma MCP's generate_figma_design tool to create the UI design
+2. Create the design in Figma file: ${figmaFileKey}
+3. Name the top-level frame "${issueKey}" so it can be found later
+4. Design a clean, modern UI that matches the description above
+5. Include all key components, layout, spacing, and visual hierarchy
+6. Use reasonable placeholder content where needed
+
+## Output:
+Describe what you designed and the Figma node/frame name you used.`;
+
+    return this.runClaudeSDK(prompt, {
+      maxTurns: this.maxTurnsPlan,
+      maxBudgetUsd: this.maxBudgetPlan,
+      permissionMode: 'dontAsk',
+      mcpServers: this.buildFigmaMcpServers(),
+    });
+  }
+
   // ── Claude Agent SDK Operations ─────────────────────────────
 
   private buildEnv(): Record<string, string | undefined> {
@@ -313,6 +372,9 @@ ${failedJobLogs}
 
   private static readonly PLAN_DELIMITER = '===FUNCTIONAL SUMMARY===';
   private static readonly QUESTIONS_DELIMITER = '===QUESTIONS===';
+  private static readonly UI_DESIGN_DELIMITER = '===UI_DESIGN===';
+
+  private figmaConfig: { mcpUrl: string | null; accessToken: string | null; fileKey: string | null };
 
   async createPlan(issueKey: string, summary: string, description: string): Promise<PlanResult> {
     const prompt = `You are analyzing Jira task ${issueKey} to create an implementation plan.
@@ -358,6 +420,13 @@ A plain-language summary for a non-technical project manager. No file names, no 
 - **What to watch out for:** Any risks, open questions, or things needing human input
 - **Scope:** Small / Medium / Large — with a one-sentence justification
 
+**Section 3 — UI Design Indicator (BELOW a second separator: ${ClaudeService.UI_DESIGN_DELIMITER})**
+Output exactly one of:
+- YES: followed by a description of what the UI should look like (layout, components, interactions, colors, spacing)
+- NO
+
+Use YES only when the task involves visible frontend/UI changes that would benefit from a visual mockup.
+
 Use Format A ONLY when the task genuinely cannot be planned without more information. If reasonable assumptions can be made, prefer Format B and note your assumptions under "What to watch out for".`;
 
     const result = await this.runClaudeSDK(prompt, {
@@ -377,19 +446,36 @@ Use Format A ONLY when the task genuinely cannot be planned without more informa
     const questionsIndex = output.indexOf(ClaudeService.QUESTIONS_DELIMITER);
     if (questionsIndex !== -1) {
       const questions = output.substring(questionsIndex + ClaudeService.QUESTIONS_DELIMITER.length).trim();
-      return { ...result, technicalPlan: '', functionalSummary: '', hasQuestions: true, questions };
+      return { ...result, technicalPlan: '', functionalSummary: '', hasQuestions: true, questions, uiDesignNeeded: false, uiDescription: '' };
     }
 
     // Otherwise parse as plan
     const delimIndex = output.indexOf(ClaudeService.PLAN_DELIMITER);
     if (delimIndex === -1) {
-      return { ...result, technicalPlan: output, functionalSummary: output, hasQuestions: false, questions: '' };
+      return { ...result, technicalPlan: output, functionalSummary: output, hasQuestions: false, questions: '', uiDesignNeeded: false, uiDescription: '' };
     }
 
     const technicalPlan = output.substring(0, delimIndex).trim();
-    const functionalSummary = output.substring(delimIndex + ClaudeService.PLAN_DELIMITER.length).trim();
+    const afterPlan = output.substring(delimIndex + ClaudeService.PLAN_DELIMITER.length);
 
-    return { ...result, technicalPlan, functionalSummary, hasQuestions: false, questions: '' };
+    // Check for UI design section
+    const uiIndex = afterPlan.indexOf(ClaudeService.UI_DESIGN_DELIMITER);
+    let functionalSummary: string;
+    let uiDesignNeeded = false;
+    let uiDescription = '';
+
+    if (uiIndex !== -1) {
+      functionalSummary = afterPlan.substring(0, uiIndex).trim();
+      const uiSection = afterPlan.substring(uiIndex + ClaudeService.UI_DESIGN_DELIMITER.length).trim();
+      if (uiSection.toUpperCase().startsWith('YES')) {
+        uiDesignNeeded = true;
+        uiDescription = uiSection.substring(3).replace(/^[:\s]+/, '').trim();
+      }
+    } else {
+      functionalSummary = afterPlan.trim();
+    }
+
+    return { ...result, technicalPlan, functionalSummary, hasQuestions: false, questions: '', uiDesignNeeded, uiDescription };
   }
 
   async implementPlan(
@@ -398,8 +484,13 @@ Use Format A ONLY when the task genuinely cannot be planned without more informa
     description: string,
     plan: string,
     reviewerNotes: string | null,
-    worktreePath: string
+    worktreePath: string,
+    figmaDesignUrl?: string | null
   ): Promise<ClaudeResult> {
+    const figmaSection = figmaDesignUrl
+      ? `\n## UI Design Reference\nThe approved Figma design is at: ${figmaDesignUrl}\nUse the Figma MCP to view the design details and implement the UI to match it precisely.\n`
+      : '';
+
     const prompt = `You are implementing Jira task ${issueKey}. The plan was reviewed and approved.
 
 ## Task: ${summary}
@@ -409,7 +500,7 @@ ${description || 'No additional description provided.'}
 
 ## Approved Plan:
 ${plan}
-${reviewerNotes ? `\n## Reviewer Notes:\n${reviewerNotes}\n` : ''}
+${reviewerNotes ? `\n## Reviewer Notes:\n${reviewerNotes}\n` : ''}${figmaSection}
 
 ## Instructions:
 1. Follow the approved plan above
@@ -418,7 +509,7 @@ ${reviewerNotes ? `\n## Reviewer Notes:\n${reviewerNotes}\n` : ''}
 4. Run existing tests to make sure nothing is broken
 5. Run the linter if configured
 6. Keep changes focused — only what the plan describes
-7. Add or update tests if the plan calls for it
+7. Add or update tests if the plan calls for it${figmaDesignUrl ? '\n8. Match the Figma design as closely as possible for any UI components' : ''}
 
 Provide a brief summary of what was changed when done.`;
 
@@ -427,6 +518,7 @@ Provide a brief summary of what was changed when done.`;
       maxBudgetUsd: this.maxBudgetImplement,
       permissionMode: 'acceptEdits',
       cwd: worktreePath,
+      mcpServers: figmaDesignUrl ? this.buildFigmaMcpServers() : undefined,
     });
   }
 
@@ -481,6 +573,7 @@ Focus specifically on addressing the feedback. Provide a brief summary of what y
       allowedTools?: string[];
       resume?: string;
       cwd?: string;
+      mcpServers?: Record<string, { type: 'http'; url: string; headers?: Record<string, string> }>;
     }
   ): Promise<ClaudeResult> {
     let outputText = '';
@@ -499,6 +592,7 @@ Focus specifically on addressing the feedback. Provide a brief summary of what y
           stderr: (data: string) => this.log.debug(`[claude-sdk] ${data.trimEnd()}`),
           ...(options.allowedTools ? { allowedTools: options.allowedTools } : {}),
           ...(options.resume ? { resume: options.resume } : {}),
+          ...(options.mcpServers ? { mcpServers: options.mcpServers } : {}),
         },
       });
 
